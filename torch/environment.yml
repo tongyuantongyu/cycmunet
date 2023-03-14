@@ -1,0 +1,19 @@
+name: CycMuNet
+channels:
+  - conda-forge
+  - pytorch
+  - fastai
+  - nvidia
+dependencies:
+  - pytorch
+  - torchvision
+  - pytorch-cuda=11.8
+  - ipython
+  - opencv-python-headless
+  - av
+  - tqdm
+  - tabulate
+  - onnx
+  - pip:
+      - onnx-simplifier==0.4.17
+      - pytorch-msssim==0.2.1
