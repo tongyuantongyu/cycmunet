@@ -5,10 +5,10 @@ This repo contains the implementation of the CVPR 2022 paper
 in multiple platforms.
 See README in each folder for detail information.
 
-torch contains PyTorch implementation of train and test code.
+[torch](https://github.com/tongyuantongyu/cycmunet/tree/main/torch) contains PyTorch implementation of train and test code.
 
-mindspore contains MindSpore implementation of train and test code
+[mindspore](https://github.com/tongyuantongyu/cycmunet/tree/main/mindspore) contains MindSpore implementation of train and test code
 capable of running on Huawei Ascend platform.
 
-tensorrt contains TensorRT implementation of inference code,
+[tensorrt](https://github.com/tongyuantongyu/cycmunet/tree/main/tensorrt) contains TensorRT implementation of inference code,
 as well as a VapourSynth plugin ready for use.
