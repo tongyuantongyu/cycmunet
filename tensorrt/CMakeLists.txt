@@ -26,8 +26,8 @@ if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/source-charset:utf-8$<SEMICOLON>/execution-charset:us-ascii$<SEMICOLON>/wd4996>)
 endif()
 
-find_package(CUDAToolkit 11.8 REQUIRED COMPONENTS cublas)
-find_package(TensorRT 8.5 REQUIRED COMPONENTS OnnxParser)
+find_package(CUDAToolkit 12.0 REQUIRED COMPONENTS cublas)
+find_package(TensorRT 8.6 REQUIRED COMPONENTS OnnxParser)
 
 option(BUILD_TESTS "Build unit test" OFF)
 if(BUILD_TESTS)

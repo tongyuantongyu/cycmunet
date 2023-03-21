@@ -116,11 +116,8 @@ nvinfer1::IBuilderConfig *OptimizationContext::prepareConfig() const {
   conf->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
   // /usr/src/tensorrt/bin/trtexec --verbose --noDataTransfers --useCudaGraph --separateProfileRun --useSpinWait --nvtxMode=verbose --loadEngine=./mutual_cycle.engine --exportTimes=./mutual_cycle.timing.json --exportProfile=./mutual_cycle.profile.json --exportLayerInfo=./mutual_cycle.graph.json --timingCacheFile=./timing.cache --best --avgRuns=1000 "--shapes=lf0:1x64x180x270,lf1:1x64x180x270,lf2:1x64x180x270"
   conf->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
-  conf->setPreviewFeature(nvinfer1::PreviewFeature::kFASTER_DYNAMIC_SHAPES_0805, true);
-//  conf->setTacticSources(conf->getTacticSources() & ~nvinfer1::TacticSources(1u << int32_t(nvinfer1::TacticSource::kCUDNN)));
   if (config.low_mem) {
     conf->setTacticSources(conf->getTacticSources() & ~nvinfer1::TacticSources(1u << int32_t(nvinfer1::TacticSource::kEDGE_MASK_CONVOLUTIONS)));
-    conf->setPreviewFeature(nvinfer1::PreviewFeature::kDISABLE_EXTERNAL_TACTIC_SOURCES_FOR_CORE_0805, true);
   }
 
   if (cache != nullptr) {
@@ -175,7 +172,7 @@ OptimizationContext::~OptimizationContext() {
   }
 }
 
-int OptimizationContext::optimize(const std::string &folder) {
+int OptimizationContext::optimize(const std::filesystem::path &folder) {
   auto fe_target = path_prefix / "engines" / folder / fe_engine_name(config);
   if (!exists(fe_target)) {
     auto fe_source_file = path_prefix / "models" / folder / ("fe" + model_name_suffix(config));

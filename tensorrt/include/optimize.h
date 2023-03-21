@@ -32,6 +32,6 @@ class OptimizationContext {
 
  public:
   OptimizationContext(OptimizationConfig config, nvinfer1::ILogger &logger, std::filesystem::path path_prefix);
-  int optimize(const std::string& folder);
+  int optimize(const std::filesystem::path &folder);
   ~OptimizationContext();
 };
