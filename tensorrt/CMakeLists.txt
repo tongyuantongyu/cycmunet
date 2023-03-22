@@ -114,4 +114,11 @@ if(VAPOURSYNTH_PLUGIN)
                           C_VISIBILITY_PRESET hidden
                           CXX_VISIBILITY_PRESET hidden
                           CUDA_VISIBILITY_PRESET hidden)
+    if(MSVC)
+        target_link_libraries(vs-cycmunet PUBLIC delayimp)
+        target_link_options(vs-cycmunet PUBLIC
+                            /DELAYLOAD:cudart64_12.dll
+                            /DELAYLOAD:nvinfer.dll
+                            /DELAYLOAD:nvonnxparser.dll)
+    endif()
 endif()
