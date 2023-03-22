@@ -300,9 +300,12 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
     model_path = model_path.remove_filename() / "dev.tyty.aim.cycmunet";
   }
 
-  model = vsapi->mapGetData(in, "model", 0, &err);
+  std::string model_name = vsapi->mapGetData(in, "model", 0, &err);
   if (err) {
     model = ".";
+  }
+  else {
+    model = model_name;
   }
 
   auto low_mem = bool(vsapi->mapGetInt(in, "low_mem", 0, &err));
