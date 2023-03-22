@@ -2,6 +2,21 @@
 
 This is the TensorRT implementation of CycMuNet+ capable of running on NVIDIA GPU.
 
+## Installation
+
+We provide precompiled binary of VapourSynth plugin for Windows and
+Linux x64 platforms on Anaconda, and recommend installing via conda:
+
+```bash
+conda create -n cycmunet -c conda-forge -c nvidia -c tongyuantongyu vapoursynth-cycmunet
+```
+
+We recommend enable CUDA lazy loading by running the following command:
+
+```bash
+conda env config vars set CUDA_MODULE_LOADING=LAZY -n cycmunet
+```
+
 ## Build
 
 Building requires CUDAToolkit and TensorRT installed. As usual, you can set 
@@ -42,6 +57,8 @@ cycmunet_y4m input.y4m output.y4m
 ### `vs-cycmunet`
 
 VapourSynth plugin. Supports RGB and YUV inputs.
+See [VapourSynth documentation](http://vapoursynth.com/doc) for the usage of
+VapourSynth.
 
 ```python
 def core.cycmunet.CycMuNet(clip: vs.VideoNode,
@@ -77,4 +94,11 @@ def core.cycmunet.CycMuNet(clip: vs.VideoNode,
     :return: Output clip
     """
     pass
+```
+
+See demo.vpy for a basic example of how to use the plugin in VapourSynth script.
+
+The following command can be used to get output video:
+```bash
+vspipe demo.vpy -c y4m - | ffmpeg -i - -c:v libx264 output.mp4
 ```
