@@ -102,3 +102,6 @@ The following command can be used to get output video:
 ```bash
 vspipe demo.vpy -c y4m - | ffmpeg -i - -c:v libx264 output.mp4
 ```
+
+The plugin reads `_SceneChangePrev` property on frame to handle scene change.
+You can use other plugins to add scene change information.
