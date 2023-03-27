@@ -313,8 +313,8 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
     low_mem = false;
   }
 
-  config = {int32_t(alignment(vi->width, 32)),
-            int32_t(alignment(vi->height, 32)),
+  config = {int32_t(vi->width),
+            int32_t(vi->height),
             batch_size,
             batch_size_fusion,
             64,

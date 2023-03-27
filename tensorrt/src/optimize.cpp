@@ -306,12 +306,12 @@ int OptimizationContext::buildFeatureFusion(std::vector<uint8_t> input, const st
         f2.c_str(), nvinfer1::OptProfileSelector::kMAX,
         nvinfer1::Dims4 {config.batch_fusion.max, config.feature_count, layer_height.max, layer_width.max});
 
-    layer_height.min /= 2;
-    layer_height.opt /= 2;
-    layer_height.max /= 2;
-    layer_width.min /= 2;
-    layer_width.opt /= 2;
-    layer_width.max /= 2;
+    layer_height.min = (layer_height.min + 1) / 2;
+    layer_height.opt = (layer_height.opt + 1) / 2;
+    layer_height.max = (layer_height.max + 1) / 2;
+    layer_width.min = (layer_width.min + 1) / 2;
+    layer_width.opt = (layer_width.opt + 1) / 2;
+    layer_width.max = (layer_width.max + 1) / 2;
   }
 
   for (int i = 0; i < network->getNbInputs(); ++i) {

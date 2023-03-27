@@ -157,7 +157,7 @@ InferenceSession::InferenceSession(InferenceContext &ctx)
   context.feature_fusion->setOptimizationProfileAsync(0, stream);
 
   input_size_ = input_count * eSize;
-  feature_size = input_count * feature_count * eSize;
+  feature_sizes.resize(config.extraction_layers);
   output_size_ = output_count * eSize;
 
   if (config.format == IOFormat::RGB) {
@@ -169,10 +169,14 @@ InferenceSession::InferenceSession(InferenceContext &ctx)
     CUDA_CHECK(cudaMallocAsync(&cudaBuffers[0], config.batch_extract * input_size_, stream));
     CUDA_CHECK(cudaMallocAsync(&cudaBuffers[1], config.batch_extract * input_size_ / 4 * 2, stream));
 
-    auto extract_size = feature_size;
+    auto layer_width = input_width;
+    auto layer_height = input_height;
     for (int i = 0; i < config.extraction_layers; ++i) {
-      CUDA_CHECK(cudaMallocAsync(&cudaBuffers[2 + i], (config.batch_extract + 1) * extract_size, stream));
-      extract_size /= 4;
+      auto layer_size = layer_width * layer_height * feature_count * eSize;
+      CUDA_CHECK(cudaMallocAsync(&cudaBuffers[2 + i], (config.batch_extract + 1) * layer_size, stream));
+      feature_sizes[i] = layer_size;
+      layer_width = (layer_width + 1) / 2;
+      layer_height = (layer_width + 1) / 2;
     }
 
     const auto offset = 2 + config.extraction_layers;
@@ -240,11 +244,9 @@ void InferenceSession::extractBatch(int32_t offset_in, int32_t offset_out, int32
 
   if (offset_out != last_offset_out.feature_extract) {
     auto baseBuffer = cudaBuffers.data() + (config.format == IOFormat::RGB ? 1 : 2);
-    auto layer_size = feature_size;
     for (int i = 0; i < config.extraction_layers; ++i) {
       context.feature_extract->setTensorAddress(("l" + std::to_string(i)).c_str(),
-                                                ptr_add(baseBuffer[i], offset_out * layer_size));
-      layer_size /= 4;
+                                                ptr_add(baseBuffer[i], offset_out * feature_sizes[i]));
     }
 
     last_offset_out.feature_extract = offset_out;
@@ -270,20 +272,18 @@ void InferenceSession::fusionBatch(int32_t offset_in, int32_t offset_out, int32_
                                             {4, {batch, feature_count, layer_height, layer_width}});
       context.feature_fusion->setInputShape(("f2l" + std::to_string(i)).c_str(),
                                             {4, {batch, feature_count, layer_height, layer_width}});
-      layer_width /= 2;
-      layer_height /= 2;
+      layer_width = (layer_width + 1) / 2;
+      layer_height = (layer_height + 1) / 2;
     }
     last_batch.feature_fusion = batch;
   }
 
   auto baseBuffer = cudaBuffers.data() + (config.format == IOFormat::RGB ? 1 : 2);
   if (offset_in != last_offset_in.feature_fusion) {
-    auto layer_size = feature_size;
     for (int i = 0; i < config.extraction_layers; ++i) {
-      auto l0 = ptr_add(baseBuffer[i], offset_in * layer_size);
+      auto l0 = ptr_add(baseBuffer[i], offset_in * feature_sizes[i]);
       context.feature_fusion->setTensorAddress(("f0l" + std::to_string(i)).c_str(), l0);
-      context.feature_fusion->setTensorAddress(("f2l" + std::to_string(i)).c_str(), ptr_add(l0, layer_size));
-      layer_size /= 4;
+      context.feature_fusion->setTensorAddress(("f2l" + std::to_string(i)).c_str(), ptr_add(l0, feature_sizes[i]));
     }
 
     last_offset_in.feature_fusion = offset_in;
@@ -316,11 +316,10 @@ void InferenceSession::duplicateExtractOutput(int32_t from, int32_t to) {
   COND_CHECK(from <= config.batch_extract && to <= config.batch_extract, "invalid index");
 
   auto baseBuffer = cudaBuffers.data() + (config.format == IOFormat::RGB ? 1 : 2);
-  auto layer_size = feature_size;
   for (int i = 0; i < config.extraction_layers; ++i) {
-    CUDA_CHECK(cudaMemcpyAsync(ptr_add(baseBuffer[i], to * layer_size), ptr_add(baseBuffer[i], from * layer_size),
-                               layer_size, cudaMemcpyDeviceToDevice, stream));
-    layer_size /= 4;
+    CUDA_CHECK(cudaMemcpyAsync(ptr_add(baseBuffer[i], to * feature_sizes[i]),
+                               ptr_add(baseBuffer[i], from * feature_sizes[i]), feature_sizes[i],
+                               cudaMemcpyDeviceToDevice, stream));
   }
 }
 

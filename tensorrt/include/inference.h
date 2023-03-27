@@ -47,7 +47,7 @@ class InferenceSession {
   ModelStuff<int32_t> last_batch, last_offset_in, last_offset_out;
   size_t input_size_;
   size_t output_size_;
-  size_t feature_size;
+  std::vector<size_t> feature_sizes;
   bool good_;
 
  public:
