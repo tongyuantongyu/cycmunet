@@ -49,14 +49,17 @@ static inline F __device__ DCNGather(const md_view<const F, 4> &input,
                                       offset_t c,
                                       hw<offset_t> pos,
                                       hw<F> offset) {
-  const F z{};
-  F result{};
+  const F z {};
+  F result {};
 
   const auto [h, w] = input.shape.template slice<2, 2>();
-  const hw<F> ol_float{floor(offset.h), floor(offset.w)};
-  const hw<F> oh_float{ceil(offset.h), ceil(offset.w)};
+  const hw<F> ol_float {floor(offset.h), floor(offset.w)};
+  const hw<F> oh_float {ceil(offset.h), ceil(offset.w)};
 
-  const hw<offset_t> pl = pos + hw<offset_t>(ol_float), ph = pos + hw<offset_t>(oh_float);
+  hw<offset_t> pl = ol_float, ph = oh_float;
+  pl += pos;
+  ph += pos;
+
   if (ph.h < 0 || ph.w < 0 || pl.h >= h || pl.w >= w) {
     return result;
   }

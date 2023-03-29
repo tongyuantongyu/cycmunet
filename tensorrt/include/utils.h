@@ -21,6 +21,16 @@ struct hw {
     return {h + o, w + o};
   }
 
+  constexpr util_attrs hw<T>& operator+=(const hw<T>& o) noexcept {
+    *this = {h + o.h, w + o.w};
+    return *this;
+  }
+
+  constexpr util_attrs hw<T>& operator+=(const T& o) noexcept {
+    *this = {h + o, w + o};
+    return *this;
+  }
+
   constexpr util_attrs hw<T> operator-(const hw<T>& o) const noexcept {
     return {h - o.h, w - o.w};
   }
