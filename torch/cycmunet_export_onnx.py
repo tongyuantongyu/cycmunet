@@ -1,29 +1,34 @@
 import os
 import pathlib
-from collections import namedtuple
 
 import torch
 from torch.onnx import symbolic_helper
 import onnx
 import onnx.shape_inference
 import onnxsim
-import onnx_graphsurgeon as gs  # Can be installed from TensorRT SDK
+import onnx_graphsurgeon as gs
 
 from model import CycMuNet, use_fold_catconv
+from cycmunet.model import model_arg
 
-dummyArg = namedtuple('dummyArg', ('nf', 'groups', 'upscale_factor', 'format', 'layers', 'cycle_count'))
+model_args = model_arg(nf=64,
+                       groups=8,
+                       upscale_factor=2,
+                       format='yuv420',
+                       layers=4,
+                       cycle_count=3
+                       )
 
-args = dummyArg(nf=64, groups=8, upscale_factor=2, format='yuv420', layers=4, cycle_count=3)
-size = 64
-checkpoint_file = 'checkpoints/monitor-ugly-sparsity_2x_l4_c3_epoch_2.pth'
-output_path = 'onnx/monitor_omni'
+checkpoint_file = 'checkpoints/triplet_s2_2x_l4_c3_snapshot.pth'
+output_path = 'onnx/triplet_new'
 
 
+size = 1 << model_args.layers
 size_in = (size, size)
-size_out = tuple(i * args.upscale_factor for i in size_in)
+size_out = tuple(i * model_args.upscale_factor for i in size_in)
 output_path = pathlib.Path(output_path)
-config_string = f"_{args.upscale_factor}x_l{args.layers}"
-if args.format == 'yuv420':
+config_string = f"_{model_args.upscale_factor}x_l{model_args.layers}"
+if model_args.format == 'yuv420':
     size_uv_in = tuple(i // 2 for i in size_in)
     config_string += '_yuv1-1'
 
@@ -105,7 +110,7 @@ def simplify(name):
 
 
 use_fold_catconv()
-model = CycMuNet(args)
+model = CycMuNet(model_args)
 state_dict = torch.load(checkpoint_file, map_location='cpu')
 state_dict = {k: clean_fp16_subnormal(v) for k, v in state_dict.items() if '__weight_mma_mask' not in k}
 model.load_state_dict(state_dict)
@@ -118,7 +123,7 @@ if __name__ == '__main__':
     with torch.no_grad():
         print("Exporting fe...")
 
-        if args.format == 'rgb':
+        if model_args.format == 'rgb':
             fe_i = torch.zeros((2, 3, *size))
             dynamic_axes = {
                 "x": {
@@ -127,7 +132,7 @@ if __name__ == '__main__':
                     3: "input_width"
                 },
             }
-        elif args.format == 'yuv420':
+        elif model_args.format == 'yuv420':
             fe_i = tuple([torch.zeros((2, 1, *size_in)), torch.zeros((2, 2, *size_uv_in))])
             dynamic_axes = {
                 "y": {
@@ -144,16 +149,16 @@ if __name__ == '__main__':
         else:
             raise NotImplementedError()
         input_names = list(dynamic_axes.keys())
-        output_names = [f'l{i}' for i in range(args.layers)[::-1]]
+        output_names = [f'l{i}' for i in range(model_args.layers)[::-1]]
         dynamic_axes.update({f'l{i}': {
             0: "batch_size",
             2: f"feature_height_{i}",
             3: f"feature_width_{i}"
-        } for i in range(args.layers)[::-1]})
+        } for i in range(model_args.layers)[::-1]})
 
         @as_module
         def fe(*x_or_y_uv: torch.Tensor):
-            if args.format == 'rgb':
+            if model_args.format == 'rgb':
                 return model.head_fe(x_or_y_uv[0])
             else:
                 return model.head_fe(x_or_y_uv)
@@ -169,11 +174,11 @@ if __name__ == '__main__':
         ff_i = []
         input_axes = dict()
         cur_size = size_in
-        for i in range(args.layers)[::-1]:
-            ff_i.insert(0, torch.zeros(1, args.nf, *cur_size))
-            cur_size = tuple(i // 2 for i in cur_size)
+        for i in range(model_args.layers)[::-1]:
+            ff_i.insert(0, torch.zeros(1, model_args.nf, *cur_size))
+            cur_size = tuple((i + 1) // 2 for i in cur_size)
 
-        for i in range(args.layers):
+        for i in range(model_args.layers):
             axes = {
                 0: "batch_size",
                 2: f"feature_height_{i}",
@@ -181,16 +186,17 @@ if __name__ == '__main__':
             }
             input_axes[f'f0l{i}'] = axes
             input_axes[f'f2l{i}'] = axes
-        input_names = [f'f0l{i}' for i in range(args.layers)[::-1]] + [f'f2l{i}' for i in range(args.layers)[::-1]]
+        input_names = [f'f0l{i}' for i in range(model_args.layers)[::-1]] + \
+                      [f'f2l{i}' for i in range(model_args.layers)[::-1]]
         output_names = ['f1']
         dynamic_axes = dict(input_axes)
         dynamic_axes[f'f1'] = {
             0: "batch_size",
-            2: f"feature_height_{args.layers - 1}",
-            3: f"feature_width_{args.layers - 1}"
+            2: f"feature_height_{model_args.layers - 1}",
+            3: f"feature_width_{model_args.layers - 1}"
         }
 
-        if args.format == 'rgb':
+        if model_args.format == 'rgb':
             output_axes = {
                 "h0": {
                     0: "batch_size",
@@ -203,7 +209,7 @@ if __name__ == '__main__':
                     3: "output_width"
                 },
             }
-        elif args.format == 'yuv420':
+        elif model_args.format == 'yuv420':
             output_axes = {
                 "h0_y": {
                     0: "batch_size",

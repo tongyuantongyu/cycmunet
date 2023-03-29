@@ -10,6 +10,7 @@ import av
 import av.logging
 import numpy as np
 import cv2
+import torch
 import torch.utils.data as data
 
 
@@ -58,7 +59,10 @@ video_info = collections.namedtuple('video_info', [
 
 
 class VideoFrameDataset(data.Dataset):
-    def __init__(self, index_file, patch_size, scale_factor, augment, transform=None, seed=0):
+    want_shuffle = False
+    pix_type = 'yuv'
+
+    def __init__(self, index_file, patch_size, scale_factor, augment, seed=0):
         self.dataset_base = pathlib.PurePath(index_file).parent
         index_lines = [i for i in open(index_file, 'r', encoding='utf-8').read().split('\n')
                        if i if not i.startswith('#')]
@@ -81,8 +85,11 @@ class VideoFrameDataset(data.Dataset):
         self.patch_size = (patch_size, patch_size) if isinstance(patch_size, int) else patch_size
         self.scale_factor = scale_factor
         self.augment = augment
-        self.transform = transform
         self.rand = random.Random(seed)
+
+    @staticmethod
+    def transform(yuv):
+        return tuple(torch.from_numpy(i).contiguous().to(dtype=torch.float32).div(255) for i in yuv)
 
     @functools.lru_cache(2)
     def get_video(self, v_idx):
@@ -100,7 +107,8 @@ class VideoFrameDataset(data.Dataset):
         _, h, w = deg[0][0].shape
         sw, sh = self.patch_size
         sh_uv, sw_uv = sh // 2, sw // 2
-        dh, dw = self.rand.randrange(0, h - sh, 2), self.rand.randrange(0, w - sw, 2)
+        assert h >= sh and w >= sw
+        dh, dw = self.rand.randrange(0, h - sh + 2, 2), self.rand.randrange(0, w - sw + 2, 2)
         dh_uv, dw_uv = dh // 2, dw // 2
         deg = [(y[:, dh:dh+sh, dw:dw+sw], uv[:, dh_uv:dh_uv+sh_uv, dw_uv:dw_uv+sw_uv]) for y, uv in deg]
         f = self.scale_factor
@@ -128,7 +136,6 @@ class VideoFrameDataset(data.Dataset):
         org_frames, deg_frames = self._prepare_frame(org_frames, deg_frames)
         if self.augment:
             org_frames, deg_frames = self._augment_frame(org_frames, deg_frames)
-        if self.transform:
-            org_frames = [self.transform(i) for i in org_frames]
-            deg_frames = [self.transform(i) for i in deg_frames]
+        org_frames = [self.transform(i) for i in org_frames]
+        deg_frames = [self.transform(i) for i in deg_frames]
         return org_frames, deg_frames

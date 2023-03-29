@@ -1,11 +1,15 @@
 import functools
 import itertools
 import math
+from typing import Tuple, Union
+
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+
+RGBOrYUV = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 _use_fold_catconv = False
 

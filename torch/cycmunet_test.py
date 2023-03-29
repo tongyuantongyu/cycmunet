@@ -2,7 +2,6 @@ import math
 import logging
 import os
 import time
-from collections import namedtuple
 
 import tqdm
 import torch
@@ -16,24 +15,31 @@ from pytorch_msssim import SSIM
 from model import CycMuNet
 from model.util import converter, normalizer
 import dataset
+from cycmunet.model import model_arg
+from cycmunet.run import test_arg
 
+model_args = model_arg(nf=64,
+                       groups=8,
+                       upscale_factor=2,
+                       format='yuv420',
+                       layers=4,
+                       cycle_count=3
+                       )
 
-dummyArg = namedtuple('dummyArg', ('nf', 'groups', 'upscale_factor', 'format', 'layers', 'cycle_count'))
-
-args = dummyArg(nf=64, groups=8, upscale_factor=2, format='yuv420', layers=4, cycle_count=3)
-size = (256, 256)
-checkpoint = 'checkpoints/monitor-ugly-sparsity_2x_l4_c3_epoch_2.pth'
-dataset_indexes = [
-    "/root/videos/cctv-scaled/index-test-good.txt",
-    "/root/videos/cctv-scaled/index-test-ugly.txt",
-    "/root/videos/cctv-scaled/index-test-smooth.txt",
-    "/root/videos/cctv-scaled/index-test-sharp.txt",
-]
-preview_interval = 100 if (len(dataset_indexes) == 1 or math.gcd(100, len(dataset_indexes)) == 1) else 101
-seed = 0
-batch_size = 4
-fp16 = True
-
+test_args = test_arg(
+    size=(256, 256),
+    checkpoint='checkpoints/monitor-ugly-sparsity_2x_l4_c3_epoch_2.pth',
+    dataset_indexes=[
+        "/root/videos/cctv-scaled/index-test-good.txt",
+        "/root/videos/cctv-scaled/index-test-ugly.txt",
+        "/root/videos/cctv-scaled/index-test-smooth.txt",
+        "/root/videos/cctv-scaled/index-test-sharp.txt",
+    ],
+    preview_interval=100,
+    seed=0,
+    batch_size=4,
+    fp16=True,
+)
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
@@ -41,13 +47,19 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
-force_data_dtype = torch.float16 if fp16 else None
+force_data_dtype = torch.float16 if test_args.fp16 else None
 
 # --------------------------------------
 # Start of code
 
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
+preview_interval = 100 \
+    if (len(test_args.dataset_indexes) == 1 or math.gcd(100, len(test_args.dataset_indexes)) == 1) \
+    else 101
+
+nrow = 1 if test_args.size[0] * 9 > test_args.size[1] * 16 else 3
+
+torch.manual_seed(test_args.seed)
+torch.cuda.manual_seed(test_args.seed)
 
 formatter = logging.Formatter('%(asctime)s %(levelname)s [%(name)s]: %(message)s')
 
@@ -66,38 +78,42 @@ logger_init.setLevel(logging.DEBUG)
 cvt = converter()
 norm = normalizer()
 
-transform = lambda pack: tuple(torch.from_numpy(i).contiguous().to(dtype=torch.float32).div(255) for i in pack)
-if len(dataset_indexes) == 1:
-    ds_test = dataset.VideoFrameDataset(dataset_indexes[0],
-                                        size,
-                                        args.upscale_factor,
-                                        augment=True,
-                                        transform=transform,
-                                        seed=seed)
+dataset_types = {
+    'triplet': dataset.ImageSequenceDataset,
+    'video': dataset.VideoFrameDataset
+}
+Dataset = dataset_types[test_args.dataset_type]
+if len(test_args.dataset_indexes) == 1:
+    ds_test = Dataset(test_args.dataset_indexes[0],
+                      test_args.size,
+                      model_args.upscale_factor,
+                      augment=True,
+                      seed=test_args.seed)
 else:
     ds_test = dataset.InterleavedDataset(*[
-        dataset.VideoFrameDataset(dataset_index,
-                                  size,
-                                  args.upscale_factor,
-                                  augment=True,
-                                  transform=transform,
-                                  seed=seed + i)
-        for i, dataset_index in enumerate(dataset_indexes)])
+        Dataset(dataset_index,
+                test_args.size,
+                model_args.upscale_factor,
+                augment=True,
+                seed=test_args.seed + i)
+        for i, dataset_index in enumerate(test_args.dataset_indexes)])
 ds_test = DataLoader(ds_test,
                      num_workers=1,
-                     batch_size=batch_size,
-                     shuffle=False)
+                     batch_size=test_args.batch_size,
+                     shuffle=Dataset.want_shuffle,  # Video dataset friendly
+                     drop_last=True)
 
-model = CycMuNet(args)
+model = CycMuNet(model_args)
 model.eval()
 num_params = 0
 for param in model.parameters():
     num_params += param.numel()
 logger_init.info(f"Model has {num_params} parameters.")
 
-if not os.path.exists(checkpoint):
-    logger_init.warning(f"Checkpoint weight {checkpoint} not exist.")
-state_dict = torch.load(checkpoint, map_location=lambda storage, loc: storage)
+if not os.path.exists(test_args.checkpoint):
+    logger_init.error(f"Checkpoint weight {test_args.checkpoint} not exist.")
+    exit(1)
+state_dict = torch.load(test_args.checkpoint, map_location=lambda storage, loc: storage)
 load_result = model.load_state_dict(state_dict, strict=False)
 if load_result.unexpected_keys:
     logger_init.warning(f"Unknown parameters ignored: {load_result.unexpected_keys}")
@@ -140,12 +156,25 @@ if __name__ == '__main__':
         with tqdm.tqdm(total=total_iter, desc=f"Test") as progress:
             for it, data in enumerate(ds_test):
                 (hf0, hf1, hf2), (lf0, lf1, lf2) = recursive_cuda(data, force_data_dtype)
+                if Dataset.pix_type == 'yuv':
+                    target = [cvt.yuv2rgb(*inp) for inp in (hf0, hf1, hf2, lf1)]
+                else:
+                    target = [hf0, hf1, hf2, lf1]
 
                 if it % preview_interval == 0:
-                    org = [F.interpolate(cvt.yuv2rgb(y[0:1], uv[0:1]),
-                                         scale_factor=(args.upscale_factor, args.upscale_factor),
-                                         mode='nearest').detach().float().cpu()
-                           for y, uv in (lf0, lf1, lf2)]
+                    if Dataset.pix_type == 'yuv':
+                        org = [F.interpolate(cvt.yuv2rgb(y[0:1], uv[0:1]),
+                                             scale_factor=(model_args.upscale_factor, model_args.upscale_factor),
+                                             mode='nearest').detach().float().cpu()
+                               for y, uv in (lf0, lf1, lf2)]
+                    else:
+                        org = [F.interpolate(lf[0:1],
+                                             scale_factor=(model_args.upscale_factor, model_args.upscale_factor),
+                                             mode='nearest').detach().float().cpu()
+                               for lf in (lf0, lf1, lf2)]
+
+                if Dataset.pix_type == 'rgb':
+                    lf0, lf2 = cvt.rgb2yuv(lf0), cvt.rgb2yuv(lf2)
 
                 t0 = time.perf_counter()
                 lf0, lf2 = norm.normalize_yuv_420(*lf0), norm.normalize_yuv_420(*lf2)
@@ -154,7 +183,6 @@ if __name__ == '__main__':
                 t1 = time.perf_counter()
                 t_forward = t1 - t0
                 actual = [cvt.yuv2rgb(*norm.denormalize_yuv_420(*out)).float() for out in outs]
-                target = [cvt.yuv2rgb(*inp).float() for inp in (hf0, hf1, hf2, lf1)]
 
                 if it % preview_interval == 0:
                     out = [i[0:1].detach().float().cpu() for i in actual[:3]]
@@ -162,7 +190,7 @@ if __name__ == '__main__':
 
                     for idx, ts in enumerate(zip(org, out, ref)):
                         torchvision.utils.save_image(torch.concat(ts), f"./result/out{idx}.png",
-                                                     value_range=(0, 1), nrow=1, padding=0)
+                                                     value_range=(0, 1), nrow=nrow, padding=0)
 
                 rmse_loss = [rmse(a, t).item() for a, t in zip(actual, target)]
                 ssim_loss = [ssim(a, t).item() for a, t in zip(actual, target)]

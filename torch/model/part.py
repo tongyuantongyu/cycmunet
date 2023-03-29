@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -72,94 +74,38 @@ class DCN_sep(nn.Module):
         return self.dcn(input, offset, mask)
 
 
-class Pro_align(nn.Module):
-    def __init__(self, args):
-        super(Pro_align, self).__init__()
+class PCDLayer(nn.Module):
+    """ Alignment module using Pyramid, Cascading and Deformable convolution"""
+    def __init__(self, args, first_layer: bool):
+        super(PCDLayer, self).__init__()
         self.args = args
         self.nf = self.args.nf
-        self.conv1x1 = nn.Conv2d(self.nf * 3, self.nf, 1, 1, 0)
-        self.conv3x3 = nn.Conv2d(self.nf, self.nf, 3, 1, 1)
-        self.conv1_3x3 = nn.Conv2d(self.nf * 2, self.nf, 3, 1, 1)
+        self.groups = self.args.groups
+
+        self.offset_conv1 = nn.Conv2d(2 * self.nf, self.nf, 3, 1, 1)
+        self.offset_conv3 = nn.Conv2d(self.nf, self.nf, 3, 1, 1)
+        self.dcnpack = DCN_sep(self.nf, self.nf, self.nf, 3, stride=1, padding=1, dilation=1,
+                               deformable_groups=self.groups)
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
-    def forward(self, l1, l2, l3):
-        r1 = self.lrelu(self.conv3x3(l1))
-        r2 = self.lrelu(self.conv3x3(l2))
-        r3 = self.lrelu(self.conv3x3(l3))
-        fuse = self.lrelu(cat_conv(self.conv1x1, [r1, r2, r3]))
-        r1 = self.lrelu(cat_conv(self.conv1_3x3, [r1, fuse]))
-        r2 = self.lrelu(cat_conv(self.conv1_3x3, [r2, fuse]))
-        r3 = self.lrelu(cat_conv(self.conv1_3x3, [r3, fuse]))
-        return l1 + r1, l2 + r2, l3 + r3
+        if not first_layer:
+            self.offset_conv2 = nn.Conv2d(2 * self.nf, self.nf, 3, 1, 1)
+            self.fea_conv = nn.Conv2d(2 * self.nf, self.nf, 3, 1, 1)
 
-
-class SR(nn.Module):
-    def __init__(self, args):
-        super(SR, self).__init__()
-        self.args = args
-        self.nf = self.args.nf
-        self.factor = (self.args.upscale_factor, self.args.upscale_factor)
-        self.Pro_align = Pro_align(args)
-        self.conv1x1 = nn.Conv2d(self.nf, self.nf, 1, 1, 0)
-        self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
-
-    def upsample(self, x):
-        x = F.interpolate(x, scale_factor=self.factor, mode='bilinear', align_corners=False)
-        return self.lrelu(self.conv1x1(x))
-
-    def forward(self, l1, l2, l3):
-        l1, l2, l3 = self.Pro_align(l1, l2, l3)
-        return tuple(self.upsample(i) for i in (l1, l2, l3))
-
-
-class DR(nn.Module):
-    def __init__(self, args):
-        super(DR, self).__init__()
-        self.args = args
-        self.nf = self.args.nf
-        self.factor = (1 / self.args.upscale_factor, 1 / self.args.upscale_factor)
-        self.Pro_align = Pro_align(args)
-        self.conv = nn.Conv2d(self.nf, self.nf, 1, 1, 0)
-        self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
-
-    def downsample(self, x):
-        x = F.interpolate(x, scale_factor=self.factor, mode='bilinear', align_corners=False)
-        return self.lrelu(self.conv(x))
-
-    def forward(self, l1, l2, l3):
-        l1 = self.downsample(l1)
-        l2 = self.downsample(l2)
-        l3 = self.downsample(l3)
-        return self.Pro_align(l1, l2, l3)
-
-
-class Up_projection(nn.Module):
-    def __init__(self, args):
-        super(Up_projection, self).__init__()
-        self.args = args
-        self.SR = SR(args)
-        self.DR = DR(args)
-        self.SR1 = SR(args)
-
-    def forward(self, l1, l2, l3):
-        h1, h2, h3 = self.SR(l1, l2, l3)
-        d1, d2, d3 = self.DR(h1, h2, h3)
-        r1, r2, r3 = d1 - l1, d2 - l2, d3 - l3
-        s1, s2, s3 = self.SR1(r1, r2, r3)
-        return h1 + s1, h2 + s3, h3 + s3
-
-
-class Down_projection(nn.Module):
-    def __init__(self, args):
-        super(Down_projection, self).__init__()
-        self.args = args
-        self.SR = SR(args)
-        self.DR = DR(args)
-        self.DR1 = DR(args)
-
-    def forward(self, h1, h2, h3):
-        l1, l2, l3 = self.DR(h1, h2, h3)
-        s1, s2, s3 = self.SR(l1, l2, l3)
-        r1, r2, r3 = s1 - h1, s2 - h2, s3 - h3
-        d1, d2, d3 = self.DR1(r1, r2, r3)
-        return l1 + d1, l2 + d2, l3 + d3
+    def forward(self, current_sources: Tuple[torch.Tensor, torch.Tensor],
+                last_offset: torch.Tensor, last_feature: torch.Tensor):
+        offset = self.lrelu(cat_conv(self.offset_conv1, current_sources))
+        if last_offset is not None:
+            last_offset = F.interpolate(last_offset, scale_factor=2, mode='bilinear', align_corners=False)
+            _, _, h, w = offset.shape
+            last_offset = last_offset[..., :h, :w]
+            offset = self.lrelu(cat_conv(self.offset_conv2, (offset, last_offset * 2)))
+        offset = self.lrelu(self.offset_conv3(offset))
+        feature = self.dcnpack(current_sources[0], offset)
+        if last_feature is not None:
+            last_feature = F.interpolate(last_feature, scale_factor=2, mode='bilinear', align_corners=False)
+            _, _, h, w = feature.shape
+            last_feature = last_feature[..., :h, :w]
+            feature = cat_conv(self.fea_conv, (feature, last_feature))
+        feature = self.lrelu(feature)
+        return offset, feature
