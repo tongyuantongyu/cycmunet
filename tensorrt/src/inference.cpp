@@ -232,11 +232,14 @@ void InferenceSession::extractBatch(int32_t offset_in, int32_t offset_out, int32
 
   if (batch != last_batch.feature_extract) {
     if (config.format == IOFormat::RGB) {
-      context.feature_extract->setInputShape("rgb", {4, {batch, 3, input_height, input_width}});
+      COND_CHECK(context.feature_extract->setInputShape("rgb", {4, {batch, 3, input_height, input_width}}),
+                 "failed configure shape for input `rgb`.");
     }
     else if (config.format == IOFormat::YUV420) {
-      context.feature_extract->setInputShape("y", {4, {batch, 1, input_height, input_width}});
-      context.feature_extract->setInputShape("uv", {4, {batch, 2, input_height / 2, input_width / 2}});
+      COND_CHECK(context.feature_extract->setInputShape("y", {4, {batch, 1, input_height, input_width}}),
+                 "failed configure shape for input `y`.");
+      COND_CHECK(context.feature_extract->setInputShape("uv", {4, {batch, 2, input_height / 2, input_width / 2}}),
+                 "failed configure shape for input `uv`.");
     }
     last_batch.feature_extract = batch;
   }
@@ -244,13 +247,14 @@ void InferenceSession::extractBatch(int32_t offset_in, int32_t offset_out, int32
   if (offset_in != last_offset_in.feature_extract) {
     if (config.format == IOFormat::RGB) {
       input[0] = ptr_add(cudaBuffers[0], offset_in * input_size_ * 3);
-      context.feature_extract->setTensorAddress("rgb", input[0]);
+      COND_CHECK(context.feature_extract->setTensorAddress("rgb", input[0]),
+                 "failed configure memory for input `rgb`.");
     }
     else if (config.format == IOFormat::YUV420) {
       input[0] = ptr_add(cudaBuffers[0], offset_in * input_size_);
       input[1] = ptr_add(cudaBuffers[1], offset_in * input_size_ / 4 * 2);
-      context.feature_extract->setTensorAddress("y", input[0]);
-      context.feature_extract->setTensorAddress("uv", input[1]);
+      COND_CHECK(context.feature_extract->setTensorAddress("y", input[0]), "failed configure memory for input `y`.");
+      COND_CHECK(context.feature_extract->setTensorAddress("uv", input[1]), "failed configure memory for input `uv`.");
     }
 
     last_offset_in.feature_extract = offset_in;
@@ -259,8 +263,9 @@ void InferenceSession::extractBatch(int32_t offset_in, int32_t offset_out, int32
   if (offset_out != last_offset_out.feature_extract) {
     auto baseBuffer = cudaBuffers.data() + (config.format == IOFormat::RGB ? 1 : 2);
     for (int i = 0; i < config.extraction_layers; ++i) {
-      context.feature_extract->setTensorAddress(("l" + std::to_string(i)).c_str(),
-                                                ptr_add(baseBuffer[i], offset_out * feature_sizes[i]));
+      COND_CHECK(context.feature_extract->setTensorAddress(("l" + std::to_string(i)).c_str(),
+                                                           ptr_add(baseBuffer[i], offset_out * feature_sizes[i])),
+                 "failed configure memory for output `l" << i << "`.");
     }
 
     last_offset_out.feature_extract = offset_out;
@@ -282,10 +287,12 @@ void InferenceSession::fusionBatch(int32_t offset_in, int32_t offset_out, int32_
     auto layer_width = input_width;
     auto layer_height = input_height;
     for (int i = 0; i < config.extraction_layers; ++i) {
-      context.feature_fusion->setInputShape(("f0l" + std::to_string(i)).c_str(),
-                                            {4, {batch, feature_count, layer_height, layer_width}});
-      context.feature_fusion->setInputShape(("f2l" + std::to_string(i)).c_str(),
-                                            {4, {batch, feature_count, layer_height, layer_width}});
+      COND_CHECK(context.feature_fusion->setInputShape(("f0l" + std::to_string(i)).c_str(),
+                                                       {4, {batch, feature_count, layer_height, layer_width}}),
+                 "failed configure shape for input `f0l" << i << "`.");
+      COND_CHECK(context.feature_fusion->setInputShape(("f2l" + std::to_string(i)).c_str(),
+                                                       {4, {batch, feature_count, layer_height, layer_width}}),
+                 "failed configure shape for input `f2l" << i << "`.");
       layer_width = (layer_width + 1) / 2;
       layer_height = (layer_height + 1) / 2;
     }
@@ -296,8 +303,11 @@ void InferenceSession::fusionBatch(int32_t offset_in, int32_t offset_out, int32_
   if (offset_in != last_offset_in.feature_fusion) {
     for (int i = 0; i < config.extraction_layers; ++i) {
       auto l0 = ptr_add(baseBuffer[i], offset_in * feature_sizes[i]);
-      context.feature_fusion->setTensorAddress(("f0l" + std::to_string(i)).c_str(), l0);
-      context.feature_fusion->setTensorAddress(("f2l" + std::to_string(i)).c_str(), ptr_add(l0, feature_sizes[i]));
+      COND_CHECK(context.feature_fusion->setTensorAddress(("f0l" + std::to_string(i)).c_str(), l0),
+                 "failed configure memory for input `f0l" << i << "`.");
+      COND_CHECK(
+          context.feature_fusion->setTensorAddress(("f2l" + std::to_string(i)).c_str(), ptr_add(l0, feature_sizes[i])),
+          "failed configure memory for input `f2l" << i << "`.");
     }
 
     last_offset_in.feature_fusion = offset_in;
@@ -308,18 +318,22 @@ void InferenceSession::fusionBatch(int32_t offset_in, int32_t offset_out, int32_
     if (config.format == IOFormat::RGB) {
       output[0] = ptr_add(baseBuffer[0], offset_out * output_size_);
       output[1] = ptr_add(output[0], config.batch_fusion * output_size_);
-      context.feature_fusion->setTensorAddress("h0", output[0]);
-      context.feature_fusion->setTensorAddress("h1", output[1]);
+      COND_CHECK(context.feature_fusion->setTensorAddress("h0", output[0]), "failed configure memory for output `h0`.");
+      COND_CHECK(context.feature_fusion->setTensorAddress("h1", output[1]), "failed configure memory for output `h1`.");
     }
     else if (config.format == IOFormat::YUV420) {
       output[0] = ptr_add(baseBuffer[0], offset_out * output_size_);
       output[2] = ptr_add(output[0], config.batch_fusion * output_size_);
       output[1] = ptr_add(baseBuffer[1], offset_out * output_size_ / 4 * 2);
       output[3] = ptr_add(output[1], config.batch_fusion * output_size_ / 4 * 2);
-      context.feature_fusion->setTensorAddress("h0_y", output[0]);
-      context.feature_fusion->setTensorAddress("h1_y", output[2]);
-      context.feature_fusion->setTensorAddress("h0_uv", output[1]);
-      context.feature_fusion->setTensorAddress("h1_uv", output[3]);
+      COND_CHECK(context.feature_fusion->setTensorAddress("h0_y", output[0]),
+                 "failed configure memory for output `h0_y`.");
+      COND_CHECK(context.feature_fusion->setTensorAddress("h1_y", output[2]),
+                 "failed configure memory for output `h1_y`.");
+      COND_CHECK(context.feature_fusion->setTensorAddress("h0_uv", output[1]),
+                 "failed configure memory for output `h0_uv`.");
+      COND_CHECK(context.feature_fusion->setTensorAddress("h1_uv", output[3]),
+                 "failed configure memory for output `h1_uv`.");
     }
 
     last_offset_out.feature_fusion = offset_out;
