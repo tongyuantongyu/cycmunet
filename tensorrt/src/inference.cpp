@@ -161,7 +161,20 @@ InferenceSession::InferenceSession(InferenceContext &ctx)
   output_size_ = output_count * eSize;
 
   if (config.format == IOFormat::RGB) {
-    // TODO
+    cudaBuffers.resize(1 + config.extraction_layers + 1);
+    CUDA_CHECK(cudaMallocAsync(&cudaBuffers[0], config.batch_extract * input_size_ * 3, stream));
+
+    auto layer_width = input_width;
+    auto layer_height = input_height;
+    for (int i = 0; i < config.extraction_layers; ++i) {
+      auto layer_size = layer_width * layer_height * feature_count * eSize;
+      CUDA_CHECK(cudaMallocAsync(&cudaBuffers[1 + i], (config.batch_extract + 1) * layer_size, stream));
+      feature_sizes[i] = layer_size;
+      layer_width = (layer_width + 1) / 2;
+      layer_height = (layer_width + 1) / 2;
+    }
+
+    CUDA_CHECK(cudaMallocAsync(&cudaBuffers[1 + config.extraction_layers], config.batch_fusion * output_size_ * 3 * 2, stream));
   }
   else if (config.format == IOFormat::YUV420) {
     cudaBuffers.resize(2 + config.extraction_layers + 2);
@@ -219,7 +232,7 @@ void InferenceSession::extractBatch(int32_t offset_in, int32_t offset_out, int32
 
   if (batch != last_batch.feature_extract) {
     if (config.format == IOFormat::RGB) {
-      // TODO
+      context.feature_extract->setInputShape("rgb", {4, {batch, 3, input_height, input_width}});
     }
     else if (config.format == IOFormat::YUV420) {
       context.feature_extract->setInputShape("y", {4, {batch, 1, input_height, input_width}});
@@ -230,7 +243,8 @@ void InferenceSession::extractBatch(int32_t offset_in, int32_t offset_out, int32
 
   if (offset_in != last_offset_in.feature_extract) {
     if (config.format == IOFormat::RGB) {
-      // TODO
+      input[0] = ptr_add(cudaBuffers[0], offset_in * input_size_ * 3);
+      context.feature_extract->setTensorAddress("rgb", input[0]);
     }
     else if (config.format == IOFormat::YUV420) {
       input[0] = ptr_add(cudaBuffers[0], offset_in * input_size_);
@@ -292,7 +306,10 @@ void InferenceSession::fusionBatch(int32_t offset_in, int32_t offset_out, int32_
   if (offset_out != last_offset_out.feature_fusion) {
     baseBuffer += config.extraction_layers;
     if (config.format == IOFormat::RGB) {
-      // TODO
+      output[0] = ptr_add(baseBuffer[0], offset_out * output_size_);
+      output[1] = ptr_add(output[0], config.batch_fusion * output_size_);
+      context.feature_fusion->setTensorAddress("h0", output[0]);
+      context.feature_fusion->setTensorAddress("h1", output[1]);
     }
     else if (config.format == IOFormat::YUV420) {
       output[0] = ptr_add(baseBuffer[0], offset_out * output_size_);

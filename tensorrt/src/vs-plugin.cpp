@@ -175,6 +175,10 @@ class CycMuNetFilter {
   std::string readYUV(offset_t position, const VSFrame *frame, const VSAPI *vsapi);
   template<class U>
   std::string writeYUV(offset_t position, VSFrame *frame, const VSAPI *vsapi);
+  template<class U>
+  std::string readRGB(offset_t position, const VSFrame *frame, const VSAPI *vsapi);
+  template<class U>
+  std::string writeRGB(offset_t position, VSFrame *frame, const VSAPI *vsapi);
 
  public:
   VSNode *node;
@@ -742,6 +746,39 @@ std::string CycMuNetFilter::readYUV(offset_t position, const VSFrame *frame, con
 }
 
 template<class U>
+std::string CycMuNetFilter::readRGB(offset_t position, const VSFrame *frame, const VSAPI *vsapi) {
+  auto bps = vo.format.bytesPerSample;
+  md_uview<const U, 2> input_planes[3] = {
+      {reinterpret_cast<const U *>(vsapi->getReadPtr(frame, 0)), input_shape_y, {vsapi->getStride(frame, 0) / bps, 1}},
+      {reinterpret_cast<const U *>(vsapi->getReadPtr(frame, 1)), input_shape_y, {vsapi->getStride(frame, 1) / bps, 1}},
+      {reinterpret_cast<const U *>(vsapi->getReadPtr(frame, 2)), input_shape_y, {vsapi->getStride(frame, 2) / bps, 1}}};
+  md_view<U, 2> input_tmps[3] = {{reinterpret_cast<U *>(ioPointer[0]), input_shape_y},
+                                 {reinterpret_cast<U *>(ioPointer[1]), input_shape_y},
+                                 {reinterpret_cast<U *>(ioPointer[2]), input_shape_y}};
+  md_view<uint8_t, 3> rgb_tensor {static_cast<uint8_t *>(session->input[0]),
+                                  {config.batch_extract, 3, offset_t(session->input_size())}};
+
+  for (int i = 0; i < 3; ++i) {
+    uint8_t *tensor_ptr = rgb_tensor.at(i).data;
+
+    std::string result;
+    if (config.use_fp16) {
+      result = readPlane<half, U>({(half *) tensor_ptr, input_shape_y}, input_planes[i], input_tmps[i], norm.z[i].a,
+                                  norm.z[i].b);
+    }
+    else {
+      result = readPlane<float, U>({(float *) tensor_ptr, input_shape_y}, input_planes[i], input_tmps[i], norm.z[i].a,
+                                   norm.z[i].b);
+    }
+    if (!result.empty()) {
+      return result;
+    }
+  }
+
+  return "";
+}
+
+template<class U>
 std::string CycMuNetFilter::writeYUV(offset_t position, VSFrame *frame, const VSAPI *vsapi) {
   auto bps = vo.format.bytesPerSample;
   md_uview<U, 2> output_planes[3] = {
@@ -802,12 +839,45 @@ std::string CycMuNetFilter::writeYUV(offset_t position, VSFrame *frame, const VS
   return "";
 }
 
+template<class U>
+std::string CycMuNetFilter::writeRGB(offset_t position, VSFrame *frame, const VSAPI *vsapi) {
+  auto bps = vo.format.bytesPerSample;
+  md_uview<U, 2> output_planes[3] = {
+      {reinterpret_cast<U *>(vsapi->getWritePtr(frame, 0)), output_shape_y, {vsapi->getStride(frame, 0) / bps, 1}},
+      {reinterpret_cast<U *>(vsapi->getWritePtr(frame, 1)), output_shape_y, {vsapi->getStride(frame, 1) / bps, 1}},
+      {reinterpret_cast<U *>(vsapi->getWritePtr(frame, 2)), output_shape_y, {vsapi->getStride(frame, 2) / bps, 1}}};
+  md_view<U, 2> output_tmps[3] = {{reinterpret_cast<U *>(ioPointer[3]), output_shape_y},
+                                  {reinterpret_cast<U *>(ioPointer[4]), output_shape_y},
+                                  {reinterpret_cast<U *>(ioPointer[5]), output_shape_y}};
+  md_view<uint8_t, 2> y_tensor {static_cast<uint8_t *>(session->output[position % 2]),
+                                {config.batch_fusion, offset_t(session->output_size())}};
+
+  position /= 2;
+
+  for (int i = 0; i < 3; ++i) {
+    std::string result;
+    if (config.use_fp16) {
+      result = writePlane<half, U>(output_planes[i], {(half *) y_tensor.at(position).data, output_tensor_y},
+                                   output_tmps[i], denorm.z[i].a, denorm.z[i].b, y_min, y_max);
+    }
+    else {
+      result = writePlane<float, U>(output_planes[i], {(float *) y_tensor.at(position).data, output_tensor_y},
+                                    output_tmps[i], denorm.z[i].a, denorm.z[i].b, y_min, y_max);
+    }
+    if (!result.empty()) {
+      return result;
+    }
+  }
+
+  return "";
+}
+
 void CycMuNetFilter::requestFrames(int n, VSFrameContext *frameCtx, const VSAPI *vsapi) const {
   auto request = [&](int i) { vsapi->requestFrameFilter(i, node, frameCtx); };
-//  auto request = [&](int i) {
-//    vsapi->requestFrameFilter(i, node, frameCtx);
-//    logger->log(nvinfer1::ILogger::Severity::kWARNING, "Requesting f #" + std::to_string(i));
-//  };
+  //  auto request = [&](int i) {
+  //    vsapi->requestFrameFilter(i, node, frameCtx);
+  //    logger->log(nvinfer1::ILogger::Severity::kWARNING, "Requesting f #" + std::to_string(i));
+  //  };
 
   // Get the index of the first frame of current scene
   auto scene_begin_index_current = n / 2 >= scene_begin_index_pending ? scene_begin_index_pending : scene_begin_index;
@@ -834,7 +904,21 @@ void CycMuNetFilter::requestFrames(int n, VSFrameContext *frameCtx, const VSAPI 
 std::string CycMuNetFilter::prepareFrame(int n, VSFrameContext *frameCtx, const VSAPI *vsapi) {
   auto loadFrameAt = [&](const VSFrame *frame_in, int32_t offset) -> std::string {
     if (color_family == VSColorFamily::cfRGB) {
-      // TODO RGB loader
+      if (vo.format.sampleType == VSSampleType::stFloat) {
+        if (vo.format.bytesPerSample == 2) {
+          return readRGB<half>(offset, frame_in, vsapi);
+        }
+        else if (vo.format.bytesPerSample == 4) {
+          return readRGB<float>(offset, frame_in, vsapi);
+        }
+      } else {
+        if (vo.format.bytesPerSample == 1) {
+          return readRGB<uint8_t>(offset, frame_in, vsapi);
+        }
+        else if (vo.format.bytesPerSample == 2) {
+          return readRGB<uint16_t>(offset, frame_in, vsapi);
+        }
+      }
     }
     else {
       if (vo.format.sampleType == VSSampleType::stFloat) {
@@ -947,7 +1031,21 @@ std::string CycMuNetFilter::extractFrame(int n, VSFrame *&frame, VSCore *core, c
   }
 
   if (color_family == VSColorFamily::cfRGB) {
-    // TODO RGB extractor
+    if (vo.format.sampleType == VSSampleType::stFloat) {
+      if (vo.format.bytesPerSample == 2) {
+        return writeRGB<half>(offset, frame, vsapi);
+      }
+      else if (vo.format.bytesPerSample == 4) {
+        return writeRGB<float>(offset, frame, vsapi);
+      }
+    } else {
+      if (vo.format.bytesPerSample == 1) {
+        return writeRGB<uint8_t>(offset, frame, vsapi);
+      }
+      else if (vo.format.bytesPerSample == 2) {
+        return writeRGB<uint16_t>(offset, frame, vsapi);
+      }
+    }
   }
   else {
     if (vo.format.sampleType == VSSampleType::stFloat) {
