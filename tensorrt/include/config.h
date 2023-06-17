@@ -23,11 +23,16 @@ struct OptimizationConfig {
   optimization_axis batch_extract;
   optimization_axis batch_fusion;
 
+  int32_t input_count;
   int32_t feature_count;
-
-  float scale_factor;
-  IOFormat format;
   int32_t extraction_layers;
+  bool extra_frame;
+  bool double_frame;
+  bool interpolation;
+
+  float scale_factor_w;
+  float scale_factor_h;
+  IOFormat format;
 
   bool use_fp16;
   bool low_mem;
@@ -40,11 +45,16 @@ struct InferenceConfig {
   int32_t batch_extract;
   int32_t batch_fusion;
 
+  int32_t input_count;
   int32_t feature_count;
-
-  float scale_factor;
-  IOFormat format;
   int32_t extraction_layers;
+  bool extra_frame;
+  bool double_frame;
+  bool interpolation;
+
+  float scale_factor_w;
+  float scale_factor_h;
+  IOFormat format;
 
   bool use_fp16;
   bool low_mem;

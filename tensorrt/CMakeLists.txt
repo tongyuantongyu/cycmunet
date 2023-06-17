@@ -118,6 +118,7 @@ if(VAPOURSYNTH_PLUGIN)
         target_link_libraries(vs-cycmunet PUBLIC delayimp)
         target_link_options(vs-cycmunet PUBLIC
                             /DELAYLOAD:cudart64_12.dll
+                            /DELAYLOAD:cublas64_12.dll
                             /DELAYLOAD:nvinfer.dll
                             /DELAYLOAD:nvonnxparser.dll)
     endif()

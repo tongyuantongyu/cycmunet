@@ -148,95 +148,33 @@ static void __global__ BiasActivationKernel(md_view<F, 4> output,
   assert(p.activation_type == 3);
 
   // leaky_relu
-  if (v < F{}) {
+  if (v < F {}) {
     v *= p.alpha;
   }
 
   output.at(n, c, h, w) = v;
 }
 
+template<class T>
+struct cuda_type_trait {};
 
-static cublasStatus_t cublasGemm(cublasHandle_t handle,
-                                 cublasOperation_t transa,
-                                 cublasOperation_t transb,
-                                 int m,
-                                 int n,
-                                 int k,
-                                 const float *alpha, /* host or device pointer */
-                                 const float *A,
-                                 int lda,
-                                 const float *B,
-                                 int ldb,
-                                 const float *beta, /* host or device pointer */
-                                 float *C,
-                                 int ldc) {
-  return cublasSgemm_v2(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
-}
+template<>
+struct cuda_type_trait<float> {
+  constexpr static cudaDataType_t data_type = CUDA_R_32F;
+  constexpr static cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+};
 
-static cublasStatus_t cublasGemm(cublasHandle_t handle,
-                                 cublasOperation_t transa,
-                                 cublasOperation_t transb,
-                                 int m,
-                                 int n,
-                                 int k,
-                                 const half *alpha, /* host or device pointer */
-                                 const half *A,
-                                 int lda,
-                                 const half *B,
-                                 int ldb,
-                                 const half *beta, /* host or device pointer */
-                                 half *C,
-                                 int ldc) {
-  return cublasHgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
-}
+template<>
+struct cuda_type_trait<half> {
+  constexpr static cudaDataType_t data_type = CUDA_R_16F;
+  constexpr static cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
+};
 
-static cublasStatus_t cublasGemmSB(cublasHandle_t handle,
-                                   cublasOperation_t transa,
-                                   cublasOperation_t transb,
-                                   int m,
-                                   int n,
-                                   int k,
-                                   const float *alpha, /* host or device pointer */
-                                   const float *A,
-                                   int lda,
-                                   long long int strideA,
-                                   const float *B,
-                                   int ldb,
-                                   long long int strideB,
-                                   const float *beta, /* host or device pointer */
-                                   float *C,
-                                   int ldc,
-                                   long long int strideC,
-                                   int batchCount) {
-  return cublasSgemmStridedBatched(handle, transa, transb, m, n, k, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC, batchCount);
-}
-
-static cublasStatus_t cublasGemmSB(cublasHandle_t handle,
-                                   cublasOperation_t transa,
-                                   cublasOperation_t transb,
-                                   int m,
-                                   int n,
-                                   int k,
-                                   const half *alpha, /* host or device pointer */
-                                   const half *A,
-                                   int lda,
-                                   long long int strideA,
-                                   const half *B,
-                                   int ldb,
-                                   long long int strideB,
-                                   const half *beta, /* host or device pointer */
-                                   half *C,
-                                   int ldc,
-                                   long long int strideC,
-                                   int batchCount) {
-  return cublasHgemmStridedBatched(handle, transa, transb, m, n, k, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC, batchCount);
-}
+const static float fOne = 1;
+const static float fZero = 0;
 
 template<class F>
-void compute(DCNLayerInput<F> inputs,
-             DCNLayerOutput<F> outputs,
-             DCNLayerConfig config,
-             DCNLayerExtra extra,
+void compute(DCNLayerInput<F> inputs, DCNLayerOutput<F> outputs, DCNLayerConfig config, DCNLayerExtra extra,
              cudaStream_t stream) {
   assert(cudaGetLastError() == cudaSuccess);
   std::size_t count = inputs.im2col_buffer.shape.template gather<0, 1, 4, 5>().count();
@@ -261,12 +199,12 @@ void compute(DCNLayerInput<F> inputs,
 
   assert(cudaGetLastError() == cudaSuccess);
 
-  const int m = outputs.output.shape.template slice<2, 2>().count();
-  const int n = outputs.output.shape[1];
-  const int k = inputs.im2col_buffer.shape.template slice<1, 3>().count();
+  const offset_t m = outputs.output.shape.template slice<2, 2>().count();
+  const offset_t n = outputs.output.shape[1];
+  const offset_t k = inputs.im2col_buffer.shape.template slice<1, 3>().count();
 
-  F alpha = 1;
-  F beta = 0;
+  const float *alpha = &fOne;
+  const float *beta = &fZero;
 
   count = outputs.output.size();
   blocks = (count + threadCount - 1) / threadCount;
@@ -274,55 +212,23 @@ void compute(DCNLayerInput<F> inputs,
   // If activation not needed, broadcast bias and let gemm do the add for us.
   if (config.activation_type == -1) {
     BiasBroadcastKernel<<<blocks, threadCount, 0, stream>>>(outputs.output, inputs.bias, count);
-    beta = 1;
+    beta = &fOne;
     assert(cudaGetLastError() == cudaSuccess);
   }
 
-  if (extra.blasMode == 0) {
-    const auto cublasResult = cublasGemmSB(static_cast<cublasHandle_t>(extra.cublasHandle),
-                                           CUBLAS_OP_N,
-                                           CUBLAS_OP_N,
-                                           m,
-                                           n,
-                                           k,
-                                           &alpha,
-                                           inputs.im2col_buffer.data,
-                                           m,
-                                           inputs.im2col_buffer.shape.template slice<1, 5>().count(),
-                                           inputs.weight.data,
-                                           k,
-                                           0,
-                                           &beta,
-                                           outputs.output.data,
-                                           m,
-                                           outputs.output.shape.template slice<1, 3>().count(),
-                                           outputs.output.shape[0]);
+  const auto cublasResult = cublasGemmStridedBatchedEx_64(
+      static_cast<cublasHandle_t>(extra.cublasHandle), CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, alpha,
+      inputs.im2col_buffer.data, cuda_type_trait<F>::data_type, m,
+      inputs.im2col_buffer.shape.template slice<1, 5>().count(), inputs.weight.data, cuda_type_trait<F>::data_type, k,
+      0, beta, outputs.output.data, cuda_type_trait<F>::data_type, m,
+      outputs.output.shape.template slice<1, 3>().count(), outputs.output.shape[0], cuda_type_trait<F>::compute_type,
+      CUBLAS_GEMM_DEFAULT);
 
-    assert(cublasResult == CUBLAS_STATUS_SUCCESS);
-  } else {
-    for (offset_t i = 0; i < outputs.output.shape[0]; ++i) {
-      const auto cublasResult = cublasGemm(static_cast<cublasHandle_t>(extra.cublasHandle),
-                                           CUBLAS_OP_N,
-                                           CUBLAS_OP_N,
-                                           m,
-                                           n,
-                                           k,
-                                           &alpha,
-                                           inputs.im2col_buffer.at(i).data,
-                                           m,
-                                           inputs.weight.data,
-                                           k,
-                                           &beta,
-                                           outputs.output.at(i).data,
-                                           m);
-
-      assert(cublasResult == CUBLAS_STATUS_SUCCESS);
-    }
-  }
+  assert(cublasResult == CUBLAS_STATUS_SUCCESS);
 
   // Fuse bias and activation, if there are.
   if (config.activation_type != -1) {
-    bias_activation_parameters<F> ba_p{config.activation_type, F{config.alpha}, F{config.beta}};
+    bias_activation_parameters<F> ba_p {config.activation_type, F {config.alpha}, F {config.beta}};
     BiasActivationKernel<<<blocks, threadCount, 0, stream>>>(outputs.output, inputs.bias, ba_p, count);
 
     assert(cudaGetLastError() == cudaSuccess);

@@ -70,24 +70,23 @@ struct simple_array {
   }
 
   template<std::size_t begin, std::size_t count>
-  constexpr util_attrs std::enable_if_t<((begin + count) <= DIMS), simple_array<T, count>>
-  slice() const {
-    return this->_slice<begin>(std::make_index_sequence<count>{});
+  constexpr util_attrs std::enable_if_t<((begin + count) <= DIMS), simple_array<T, count>> slice() const {
+    return this->_slice<begin>(std::make_index_sequence<count> {});
   }
 
-  template<size_t ...Idx>
+  template<size_t... Idx>
   constexpr util_attrs simple_array<T, sizeof...(Idx)> gather() const {
     return {(*this)[Idx]...};
   }
 
-  template<class A, class ...IdxT, std::enable_if_t<(sizeof...(IdxT) == DIMS), bool> = true>
-  constexpr util_attrs void gather_from(A arr, IdxT... idx) {
+  template<class A, class... IdxT>
+  constexpr util_attrs std::enable_if_t<sizeof...(IdxT) == DIMS> gather_from(A arr, IdxT... idx) {
     *this = {(static_cast<T>(arr[idx]))...};
   };
 
  private:
-  template<std::size_t begin, std::size_t ...I>
-  constexpr util_attrs std::enable_if_t<((begin + sizeof...(I)) <= DIMS), simple_array<T, sizeof...(I)>>
+  template<std::size_t begin, std::size_t... I>
+  constexpr util_attrs std::enable_if_t<(begin + sizeof...(I)) <= DIMS, simple_array<T, sizeof...(I)>>
   _slice(std::index_sequence<I...>) const {
     return {(*this)[begin + I]...};
   }
@@ -104,14 +103,13 @@ struct tuple_element<Idx, simple_array<T, DIMS>> {
 };
 }
 
-template<std::size_t DIMS = 1, std::enable_if_t<(DIMS != 0), bool> = true>
+template<std::size_t DIMS = 1, typename = std::enable_if_t<(DIMS != 0)>>
 struct stride_t : simple_array<offset_t, DIMS> {
   using _base = simple_array<offset_t, DIMS>;
 
-  template<class ...Tp>
-  constexpr util_attrs std::enable_if_t<sizeof...(Tp) <= DIMS, offset_t>
-  offset(Tp ...indexes) const {
-    simple_array<offset_t, DIMS> offsets{static_cast<offset_t>(indexes)...};
+  template<class... Tp>
+  constexpr util_attrs std::enable_if_t<sizeof...(Tp) <= DIMS, offset_t> offset(Tp... indexes) const {
+    simple_array<offset_t, DIMS> offsets {static_cast<offset_t>(indexes)...};
 
     offset_t offset = 0;
     for (std::size_t i = 0; i < DIMS; ++i) {
@@ -121,8 +119,7 @@ struct stride_t : simple_array<offset_t, DIMS> {
     return offset;
   }
 
-  constexpr util_attrs simple_array<offset_t, DIMS>
-  indexes(offset_t offset) const {
+  constexpr util_attrs simple_array<offset_t, DIMS> indexes(offset_t offset) const {
     simple_array<offset_t, DIMS> indexes;
     for (std::size_t dim = 0; dim < DIMS; ++dim) {
       assert((*this)[dim] != 0);
@@ -142,25 +139,29 @@ struct stride_t : simple_array<offset_t, DIMS> {
 template<class... T>
 stride_t(T...) -> stride_t<sizeof...(T)>;
 
-template<std::size_t DIMS = 1, std::enable_if_t<(DIMS != 0), bool> = true>
+template<std::size_t DIMS = 1, typename = std::enable_if_t<(DIMS != 0)>>
 struct shape_t : simple_array<offset_t, DIMS> {
   using _base = simple_array<offset_t, DIMS>;
 
-  template<class ...Tp>
-  constexpr util_attrs std::enable_if_t<sizeof...(Tp) <= DIMS, offset_t>
-  offset(Tp ...indexes) const {
-    simple_array<offset_t, DIMS> offsets{static_cast<offset_t>(indexes)...};
-
+  template<size_t SDIMS, typename = std::enable_if_t<SDIMS <= DIMS>>
+  constexpr util_attrs offset_t offset(const shape_t<SDIMS> &offsets) const {
     offset_t offset = 0;
     for (std::size_t i = 0; i < DIMS; ++i) {
-      offset = offset * (*this)[i] + offsets[i];
+      offset = offset * (*this)[i];
+      if (i < SDIMS) {
+        offset += offsets[i];
+      }
     }
 
     return offset;
   }
 
-  constexpr util_attrs simple_array<offset_t, DIMS>
-  indexes(offset_t offset) const {
+  template<class... Tp>
+  constexpr util_attrs std::enable_if_t<sizeof...(Tp) <= DIMS, offset_t> offset(Tp... indexes) const {
+    return offset<sizeof...(Tp)>({static_cast<offset_t>(indexes)...});
+  }
+
+  constexpr util_attrs simple_array<offset_t, DIMS> indexes(offset_t offset) const {
     simple_array<offset_t, DIMS> indexes;
     for (std::size_t dim = 0; dim < DIMS; ++dim) {
       auto pos = DIMS - dim - 1;
@@ -218,11 +219,10 @@ struct tuple_element<Idx, shape_t<DIMS>> {
 };
 }
 
-
-template<class T_, std::size_t DIMS = 1, std::enable_if_t<(DIMS != 0), bool> = true>
+template<class T_, std::size_t DIMS = 1, typename = std::enable_if_t<DIMS != 0>>
 struct md_view;
 
-template<class T_, std::size_t DIMS = 1, std::enable_if_t<(DIMS != 0), bool> = true>
+template<class T_, std::size_t DIMS = 1, typename = std::enable_if_t<DIMS != 0>>
 struct md_uview;
 
 template<class T_, std::size_t DIMS>
@@ -231,7 +231,7 @@ constexpr md_uview<T_, DIMS> util_attrs to_uview(md_view<T_, DIMS>);
 template<class T_, std::size_t DIMS>
 constexpr md_view<T_, DIMS> util_attrs to_view(md_uview<T_, DIMS>);
 
-template<class T_, std::size_t DIMS, std::enable_if_t<(DIMS != 0), bool>>
+template<class T_, std::size_t DIMS, typename>
 struct md_view {
   using T = std::remove_reference_t<T_>;
   constexpr static std::size_t D = DIMS;
@@ -239,31 +239,44 @@ struct md_view {
   T *data;
   shape_t<DIMS> shape;
 
-  template<class CT = T>
-  constexpr util_attrs operator std::enable_if_t<!std::is_const_v<CT>, md_view<const CT, DIMS>>() const {
+  template<class CT = T, typename = std::enable_if_t<!std::is_const_v<CT>>>
+  constexpr util_attrs operator md_view<const CT, DIMS>() const {
     return {data, shape};
   }
 
-  constexpr util_attrs operator md_uview<T, DIMS>() const {
-    return this->as_uview();
-  }
+  constexpr util_attrs operator md_uview<T, DIMS>() const { return this->as_uview(); }
 
-  template<class ...Tp>
+  template<class... Tp>
   constexpr util_attrs std::enable_if_t<sizeof...(Tp) < DIMS, md_view<T, DIMS - sizeof...(Tp)>>
-  at(Tp ...indexes) const noexcept {
+  at(Tp... indexes) const noexcept {
     ptrdiff_t offset = shape.offset(indexes...);
 
-    auto sub_span = md_view<T, DIMS - sizeof...(Tp)>{data + offset};
+    auto sub_span = md_view<T, DIMS - sizeof...(Tp)> {data + offset};
     for (std::size_t i = sizeof...(Tp); i < DIMS; ++i) {
       sub_span.shape[i - sizeof...(Tp)] = shape[i];
     }
     return sub_span;
   }
 
-  template<class ...Tp>
-  constexpr util_attrs std::enable_if_t<sizeof...(Tp) == DIMS, T &>
-  at(Tp ...indexes) const noexcept {
+  template<class... Tp>
+  constexpr util_attrs std::enable_if_t<sizeof...(Tp) == DIMS, T &> at(Tp... indexes) const noexcept {
     return data[shape.offset(indexes...)];
+  }
+
+  template<size_t SDIMS, typename = std::enable_if_t<SDIMS<DIMS>> constexpr util_attrs md_view<T, DIMS - SDIMS> at(
+                             const shape_t<SDIMS> &offsets) const noexcept {
+    ptrdiff_t offset = shape.offset(offsets);
+
+    auto sub_span = md_view<T, DIMS - SDIMS> {data + offset};
+    for (std::size_t i = SDIMS; i < DIMS; ++i) {
+      sub_span.shape[i - SDIMS] = shape[i];
+    }
+    return sub_span;
+  }
+
+  template<size_t SDIMS, typename = std::enable_if_t<SDIMS == DIMS>>
+  constexpr util_attrs T &at(const shape_t<SDIMS> &offsets) const noexcept {
+    return data[shape.offset(offsets)];
   }
 
   template<std::size_t N_DIMS>
@@ -303,7 +316,7 @@ md_view(T *t, offset_t (&&shape)[DIMS]) -> md_view<T, DIMS>;
 template<class T, std::size_t DIMS>
 md_view(T *t, shape_t<DIMS> shape) -> md_view<T, DIMS>;
 
-template<class T_, std::size_t DIMS, std::enable_if_t<(DIMS != 0), bool>>
+template<class T_, std::size_t DIMS, typename>
 struct md_uview {
   using T = std::remove_reference_t<T_>;
   constexpr static std::size_t D = DIMS;
@@ -312,17 +325,17 @@ struct md_uview {
   shape_t<DIMS> shape;
   stride_t<DIMS> stride;
 
-  template<class CT = T>
-  constexpr util_attrs operator std::enable_if_t<!std::is_const_v<CT>, md_uview<const CT, DIMS>>() const {
+  template<class CT = T, typename = std::enable_if_t<!std::is_const_v<CT>>>
+  constexpr util_attrs operator md_uview<const CT, DIMS>() const {
     return {data, shape, stride};
   }
 
-  template<class ...Tp>
+  template<class... Tp>
   constexpr util_attrs std::enable_if_t<sizeof...(Tp) < DIMS, md_uview<T, DIMS - sizeof...(Tp)>>
-  at(Tp ...indexes) const noexcept {
+  at(Tp... indexes) const noexcept {
     ptrdiff_t offset = stride.offset(indexes...);
 
-    auto sub_span = md_uview<T, DIMS - sizeof...(Tp)>{data + offset};
+    auto sub_span = md_uview<T, DIMS - sizeof...(Tp)> {data + offset};
     for (std::size_t i = sizeof...(Tp); i < DIMS; ++i) {
       sub_span.shape[i - sizeof...(Tp)] = shape[i];
       sub_span.stride[i - sizeof...(Tp)] = stride[i];
@@ -330,19 +343,15 @@ struct md_uview {
     return sub_span;
   }
 
-  template<class ...Tp>
-  constexpr util_attrs std::enable_if_t<sizeof...(Tp) == DIMS, T &>
-  at(Tp ...indexes) const noexcept {
+  template<class... Tp>
+  constexpr util_attrs std::enable_if_t<sizeof...(Tp) == DIMS, T &> at(Tp... indexes) const noexcept {
     return data[stride.offset(indexes...)];
   }
 
-  [[nodiscard]] constexpr util_attrs offset_t size() const noexcept {
-    return this->shape.count();
-  }
+  [[nodiscard]] constexpr util_attrs offset_t size() const noexcept { return this->shape.count(); }
 
-  template<std::size_t pos>
-  constexpr util_attrs std::enable_if_t<(pos >= 0 && pos < DIMS), md_uview<T, DIMS>>
-  slice(offset_t begin = 0, offset_t end = 0) const {
+  template<std::size_t pos, typename = std::enable_if_t<pos >= 0 && pos<DIMS>> constexpr util_attrs md_uview<T, DIMS>
+                                slice(offset_t begin = 0, offset_t end = 0) const {
     begin = begin < 0 ? begin + this->shape[pos] : begin;
     end = end <= 0 ? end + this->shape[pos] : end;
     assert(begin < end);
@@ -447,6 +456,38 @@ template<class T, std::size_t DIMS>
 void util_attrs copy(const md_uview<T, DIMS> &dst, const md_uview<T, DIMS> &src) {
   md_uview<const T, DIMS> csrc = src;
   copy(dst, csrc);
+}
+
+#include <string>
+#include <ios>
+#include <iomanip>
+
+template<std::size_t DIMS>
+std::string describe(const shape_t<DIMS> &view) {
+  std::stringstream ss;
+  ss << "[";
+  for (int i = 0; i < DIMS; ++i) {
+    ss << view[i];
+    if (i + 1 != DIMS) {
+      ss << ",";
+    }
+  }
+  ss << "]";
+  return ss.str();
+}
+
+template<class T, std::size_t DIMS>
+std::string describe(const md_view<T, DIMS> &view) {
+  std::stringstream ss;
+  ss << std::internal << std::hex << std::setw(16) << std::setfill('0') << (void*)(view.data);
+  ss << "-" << std::setw(16) << (void*)((uint8_t*)(view.data) + view.size() * sizeof(T));
+  ss << std::resetiosflags(ss.basefield);
+  ss << "(" << view.size() * sizeof(T);
+  ss << ", ";
+  ss << describe(view.shape);
+  ss << ")";
+  return ss.str();
+
 }
 
 #endif //MDVIEW_H_

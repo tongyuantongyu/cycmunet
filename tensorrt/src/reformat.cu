@@ -61,8 +61,8 @@ void import_pixel(md_view<F, 2> dst, md_view<const U, 2> src, float a, float b, 
   dim3 dimBlock(32, 32);
   dim3 dimGrid;
   auto [dst_h, dst_w] = dst.shape;
-  dimGrid.x = (dst_w + 31) & (~31);
-  dimGrid.y = (dst_h + 31) & (~31);
+  dimGrid.x = (dst_w + 31) / 32;
+  dimGrid.y = (dst_h + 31) / 32;
 
   fma_from<<<dimGrid, dimBlock, 0, stream>>>(dst, src, F(a), F(b));
 }
@@ -89,8 +89,8 @@ void export_pixel(md_view<U, 2> dst, md_view<const F, 2> src, float a, float b, 
   dim3 dimBlock(32, 32);
   dim3 dimGrid;
   auto [dst_h, dst_w] = dst.shape;
-  dimGrid.x = (dst_w + 31) & (~31);
-  dimGrid.y = (dst_h + 31) & (~31);
+  dimGrid.x = (dst_w + 31) / 32;
+  dimGrid.y = (dst_h + 31) / 32;
 
   fma_to<<<dimGrid, dimBlock, 0, stream>>>(dst, src, F(a), F(b), F(min), F(max));
 }

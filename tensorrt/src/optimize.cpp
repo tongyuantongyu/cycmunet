@@ -59,10 +59,14 @@ static void inspectNetwork(nvinfer1::INetworkDefinition *network) {
 //       |
 // HR of input
 
+static constexpr size_t ceil_half(size_t size) {
+  return (size + 1) / 2;
+}
+
 static std::string model_name_suffix(const OptimizationConfig &config) {
   std::stringstream ss;
-  ss << "_" << config.scale_factor << "x"
-     << "_l" << config.extraction_layers;
+  ss << "_n" << config.input_count;
+  ss << "_" << config.scale_factor_w << "x" << config.scale_factor_h << "_l" << config.extraction_layers;
   if (config.format == IOFormat::YUV420) {
     ss << "_yuv1-1";
   }
@@ -73,8 +77,8 @@ static std::string model_name_suffix(const OptimizationConfig &config) {
 static std::string fe_engine_name(const OptimizationConfig &config) {
   std::stringstream ss;
   ss << "fe_";
-  ss << config.input_width.opt << 'x' << config.input_height.opt << '_' << config.scale_factor << "x"
-     << "_b" << config.batch_extract.opt << "_l" << config.extraction_layers;
+  ss << config.input_width.opt << 'x' << config.input_height.opt << '_' << config.scale_factor_w << "x"
+     << config.scale_factor_h << "_b" << config.batch_extract.opt << "_l" << config.extraction_layers;
   if (config.format == IOFormat::YUV420) {
     ss << "_yuv1-1";
   }
@@ -91,8 +95,16 @@ static std::string fe_engine_name(const OptimizationConfig &config) {
 static std::string ff_engine_name(const OptimizationConfig &config) {
   std::stringstream ss;
   ss << "ff_";
-  ss << config.input_width.opt << 'x' << config.input_height.opt << '_' << config.scale_factor << "x"
-     << "_b" << config.batch_fusion.opt << "_l" << config.extraction_layers;
+  ss << "n" << config.input_count;
+  if (config.double_frame) {
+    ss << "a";
+  }
+  if (config.extra_frame) {
+    ss << "+";
+  }
+  ss << "_";
+  ss << config.input_width.opt << 'x' << config.input_height.opt << '_' << config.scale_factor_w << "x"
+     << config.scale_factor_h << "_b" << config.batch_fusion.opt << "_l" << config.extraction_layers;
   if (config.format == IOFormat::YUV420) {
     ss << "_yuv1-1";
   }
@@ -116,6 +128,7 @@ nvinfer1::IBuilderConfig *OptimizationContext::prepareConfig() const {
   conf->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
   // /usr/src/tensorrt/bin/trtexec --verbose --noDataTransfers --useCudaGraph --separateProfileRun --useSpinWait --nvtxMode=verbose --loadEngine=./mutual_cycle.engine --exportTimes=./mutual_cycle.timing.json --exportProfile=./mutual_cycle.profile.json --exportLayerInfo=./mutual_cycle.graph.json --timingCacheFile=./timing.cache --best --avgRuns=1000 "--shapes=lf0:1x64x180x270,lf1:1x64x180x270,lf2:1x64x180x270"
   conf->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
+  conf->setTacticSources(conf->getTacticSources() & ~nvinfer1::TacticSources(1u << int32_t(nvinfer1::TacticSource::kCUDNN)));
   if (config.low_mem) {
     conf->setTacticSources(conf->getTacticSources() & ~nvinfer1::TacticSources(1u << int32_t(nvinfer1::TacticSource::kEDGE_MASK_CONVOLUTIONS)));
   }
@@ -139,7 +152,7 @@ OptimizationContext::OptimizationContext(OptimizationConfig config, nvinfer1::IL
   cudaMemGetInfo(nullptr, &total_memory);
   cudaGetDeviceProperties(&prop, 0);
   logger.log(nvinfer1::ILogger::Severity::kINFO,
-             ("Device has " + std::to_string(total_memory) + " byte memory.").c_str());
+             ("Device has " + std::to_string(total_memory) + " bytes memory.").c_str());
 
   if (builder->platformHasFastFp16() && !config.use_fp16) {
     // CUDA Architecture 6.1 (Pascal, GTX10xx series) does not have really useful FP16.
@@ -211,37 +224,39 @@ int OptimizationContext::buildFeatureExtract(std::vector<uint8_t> input, const s
 
   auto ioDataType = config.use_fp16 ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kFLOAT;
 
-  if (config.format == IOFormat::RGB) {
-    profile->setDimensions(
-        "x", nvinfer1::OptProfileSelector::kMIN,
-        nvinfer1::Dims4 {config.batch_extract.min, 3, config.input_height.min, config.input_width.min});
-    profile->setDimensions(
-        "x", nvinfer1::OptProfileSelector::kOPT,
-        nvinfer1::Dims4 {config.batch_extract.opt, 3, config.input_height.opt, config.input_width.opt});
-    profile->setDimensions(
-        "x", nvinfer1::OptProfileSelector::kMAX,
-        nvinfer1::Dims4 {config.batch_extract.max, 3, config.input_height.max, config.input_width.max});
-  }
-  else {
-    profile->setDimensions(
-        "y", nvinfer1::OptProfileSelector::kMIN,
-        nvinfer1::Dims4 {config.batch_extract.min, 1, config.input_height.min, config.input_width.min});
-    profile->setDimensions(
-        "y", nvinfer1::OptProfileSelector::kOPT,
-        nvinfer1::Dims4 {config.batch_extract.opt, 1, config.input_height.opt, config.input_width.opt});
-    profile->setDimensions(
-        "y", nvinfer1::OptProfileSelector::kMAX,
-        nvinfer1::Dims4 {config.batch_extract.max, 1, config.input_height.max, config.input_width.max});
+  for (int32_t i = 0; i < config.input_count; ++i) {
+    if (config.format == IOFormat::RGB) {
+      profile->setDimensions(
+          "rgb", nvinfer1::OptProfileSelector::kMIN,
+          nvinfer1::Dims4 {config.batch_extract.min, 3, config.input_height.min, config.input_width.min});
+      profile->setDimensions(
+          "rgb", nvinfer1::OptProfileSelector::kOPT,
+          nvinfer1::Dims4 {config.batch_extract.opt, 3, config.input_height.opt, config.input_width.opt});
+      profile->setDimensions(
+          "rgb", nvinfer1::OptProfileSelector::kMAX,
+          nvinfer1::Dims4 {config.batch_extract.max, 3, config.input_height.max, config.input_width.max});
+    }
+    else {
+      profile->setDimensions(
+          "y", nvinfer1::OptProfileSelector::kMIN,
+          nvinfer1::Dims4 {config.batch_extract.min, 1, config.input_height.min, config.input_width.min});
+      profile->setDimensions(
+          "y", nvinfer1::OptProfileSelector::kOPT,
+          nvinfer1::Dims4 {config.batch_extract.opt, 1, config.input_height.opt, config.input_width.opt});
+      profile->setDimensions(
+          "y", nvinfer1::OptProfileSelector::kMAX,
+          nvinfer1::Dims4 {config.batch_extract.max, 1, config.input_height.max, config.input_width.max});
 
-    profile->setDimensions(
-        "uv", nvinfer1::OptProfileSelector::kMIN,
-        nvinfer1::Dims4 {config.batch_extract.min, 2, config.input_height.min / 2, config.input_width.min / 2});
-    profile->setDimensions(
-        "uv", nvinfer1::OptProfileSelector::kOPT,
-        nvinfer1::Dims4 {config.batch_extract.opt, 2, config.input_height.opt / 2, config.input_width.opt / 2});
-    profile->setDimensions(
-        "uv", nvinfer1::OptProfileSelector::kMAX,
-        nvinfer1::Dims4 {config.batch_extract.max, 2, config.input_height.max / 2, config.input_width.max / 2});
+      profile->setDimensions(
+          "uv", nvinfer1::OptProfileSelector::kMIN,
+          nvinfer1::Dims4 {config.batch_extract.min, 2, config.input_height.min / 2, config.input_width.min / 2});
+      profile->setDimensions(
+          "uv", nvinfer1::OptProfileSelector::kOPT,
+          nvinfer1::Dims4 {config.batch_extract.opt, 2, config.input_height.opt / 2, config.input_width.opt / 2});
+      profile->setDimensions(
+          "uv", nvinfer1::OptProfileSelector::kMAX,
+          nvinfer1::Dims4 {config.batch_extract.max, 2, config.input_height.max / 2, config.input_width.max / 2});
+    }
   }
 
   for (int i = 0; i < network->getNbInputs(); ++i) {
@@ -284,34 +299,24 @@ int OptimizationContext::buildFeatureFusion(std::vector<uint8_t> input, const st
   auto layer_width = config.input_width;
 
   for (int i = 0; i < config.extraction_layers; ++i) {
-    auto f0 = "f0l" + std::to_string(i);
-    profile->setDimensions(
-        f0.c_str(), nvinfer1::OptProfileSelector::kMIN,
-        nvinfer1::Dims4 {config.batch_fusion.min, config.feature_count, layer_height.min, layer_width.min});
-    profile->setDimensions(
-        f0.c_str(), nvinfer1::OptProfileSelector::kOPT,
-        nvinfer1::Dims4 {config.batch_fusion.opt, config.feature_count, layer_height.opt, layer_width.opt});
-    profile->setDimensions(
-        f0.c_str(), nvinfer1::OptProfileSelector::kMAX,
-        nvinfer1::Dims4 {config.batch_fusion.max, config.feature_count, layer_height.max, layer_width.max});
-
-    auto f2 = "f2l" + std::to_string(i);
-    profile->setDimensions(
-        f2.c_str(), nvinfer1::OptProfileSelector::kMIN,
-        nvinfer1::Dims4 {config.batch_fusion.min, config.feature_count, layer_height.min, layer_width.min});
-    profile->setDimensions(
-        f2.c_str(), nvinfer1::OptProfileSelector::kOPT,
-        nvinfer1::Dims4 {config.batch_fusion.opt, config.feature_count, layer_height.opt, layer_width.opt});
-    profile->setDimensions(
-        f2.c_str(), nvinfer1::OptProfileSelector::kMAX,
-        nvinfer1::Dims4 {config.batch_fusion.max, config.feature_count, layer_height.max, layer_width.max});
-
-    layer_height.min = (layer_height.min + 1) / 2;
-    layer_height.opt = (layer_height.opt + 1) / 2;
-    layer_height.max = (layer_height.max + 1) / 2;
-    layer_width.min = (layer_width.min + 1) / 2;
-    layer_width.opt = (layer_width.opt + 1) / 2;
-    layer_width.max = (layer_width.max + 1) / 2;
+    for (int j = 0; j < config.input_count; ++j) {
+      auto name = "f" + std::to_string((config.interpolation ? 2 : 1) * j) + "l" + std::to_string(i);
+      profile->setDimensions(
+          name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+          nvinfer1::Dims4 {config.batch_fusion.min, config.feature_count, layer_height.min, layer_width.min});
+      profile->setDimensions(
+          name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+          nvinfer1::Dims4 {config.batch_fusion.opt, config.feature_count, layer_height.opt, layer_width.opt});
+      profile->setDimensions(
+          name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+          nvinfer1::Dims4 {config.batch_fusion.max, config.feature_count, layer_height.max, layer_width.max});
+    }
+    layer_height.min = ceil_half(layer_height.min);
+    layer_height.opt = ceil_half(layer_height.opt);
+    layer_height.max = ceil_half(layer_height.max);
+    layer_width.min = ceil_half(layer_width.min);
+    layer_width.opt = ceil_half(layer_width.opt);
+    layer_width.max = ceil_half(layer_width.max);
   }
 
   for (int i = 0; i < network->getNbInputs(); ++i) {

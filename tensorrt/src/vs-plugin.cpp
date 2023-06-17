@@ -4,6 +4,9 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <algorithm>
+
+#include <unordered_map>
 
 #include "NvInfer.h"
 #include "cuda_runtime_api.h"
@@ -33,6 +36,15 @@ class Logger : public nvinfer1::ILogger {
     if (severity_int < 0 || severity_int > 4) {
       severity_int = 0;
     }
+    if (severity == nvinfer1::ILogger::Severity::kINFO) {
+      const std::string_view message_view = message;
+      for (const auto &blocked: blockedMessages) {
+        if (message_view.starts_with(blocked)) {
+          severity_int = int32_t(nvinfer1::ILogger::Severity::kVERBOSE);
+          break;
+        }
+      }
+    }
     logMessage(typeMap[severity_int], message, core);
   }
 
@@ -55,8 +67,13 @@ class Logger : public nvinfer1::ILogger {
 #endif
 
   constexpr static VSMessageType typeMap[] = {VSMessageType::mtFatal, VSMessageType::mtWarning,
-                                              VSMessageType::mtWarning, trtInfoLevel,
-                                              VSMessageType::mtDebug};
+                                              VSMessageType::mtWarning, trtInfoLevel, VSMessageType::mtDebug};
+
+  constexpr static std::string_view blockedMessages[] = {
+      "No importer registered for op: ",
+      "Searching for plugin: ",
+      "Successfully created plugin: ",
+  };
 };
 
 struct scale_ratios_t {
@@ -111,6 +128,10 @@ static size_t alignment(size_t size, size_t alignment) {
   return (size + (alignment - 1)) & (~(alignment - 1));
 }
 
+static const char *safe_cstr(const char *str) {
+  return str ? str : "";
+}
+
 struct colorPrimariesEntry {
   VSColorPrimaries colorPrimariesEnum;
   float primaries[8];// rX, rY, gX, gY, bX, bY, wX, wY
@@ -145,10 +166,18 @@ const std::array<matrixCoefficientsEntry, 6> matrixCoefficientsTable {{{VSC_MATR
 // ---------------------------------------------------------------------------------------------------------------------
 // Filter
 
-class CycMuNetFilter {
+class NNVISRFilter {
   int num_frames;
-  int loaded_frames;
-  int scene_begin_index, scene_begin_index_pending;
+  int extract_begin;
+  int extract_end;
+  int fusion_in_begin;
+  int fusion_out_begin;
+  bool end_of_scene;
+  bool start_of_batch, start_of_scene;
+
+  int last_requested_frame;
+  int last_output_frame;
+
   VSColorFamily color_family;
   std::filesystem::path model_path;
   std::filesystem::path model;
@@ -156,7 +185,6 @@ class CycMuNetFilter {
   InferenceContext *ctx;
   InferenceSession *session;
   const VSFrame *first_frame;
-  std::vector<const VSFrame *> requested_frames;
   bool raw_norm;
   scale_ratios_t norm, denorm;
   Logger *logger;
@@ -166,34 +194,42 @@ class CycMuNetFilter {
   shape_t<2> input_shape_y, input_shape_uv, output_shape_y, output_shape_uv;
   shape_t<2> input_tensor_y, input_tensor_uv, output_tensor_y, output_tensor_uv;
 
+  //  std::unordered_map<const VSFrame *, int> frame_idx;
+
   template<class F, class U>
   std::string readPlane(md_view<F, 2> dst, md_uview<const U, 2> src, md_view<U, 2> cuda_tmp, float a, float b);
   template<class F, class U>
   std::string writePlane(md_uview<U, 2> dst, md_view<const F, 2> src, md_view<U, 2> cuda_tmp, float a, float b,
                          float min, float max);
   template<class U>
-  std::string readYUV(offset_t position, const VSFrame *frame, const VSAPI *vsapi);
+  std::string uploadYUV(offset_t position, const VSFrame *frame, const VSAPI *vsapi);
   template<class U>
-  std::string writeYUV(offset_t position, VSFrame *frame, const VSAPI *vsapi);
+  std::string downloadYUV(offset_t position, VSFrame *frame, const VSAPI *vsapi);
   template<class U>
-  std::string readRGB(offset_t position, const VSFrame *frame, const VSAPI *vsapi);
+  std::string uploadRGB(offset_t position, const VSFrame *frame, const VSAPI *vsapi);
   template<class U>
-  std::string writeRGB(offset_t position, VSFrame *frame, const VSAPI *vsapi);
+  std::string downloadRGB(offset_t position, VSFrame *frame, const VSAPI *vsapi);
+
+  void trace(const std::string &info) {
+    // no fold
+//         logger->log(Logger::Severity::kWARNING, "NNVISR Trace: " + info);
+  }
 
  public:
   VSNode *node;
-  VSVideoInfo vo;
+  VSVideoInfo vi, vo;
+  std::vector<const VSFrame *> requested_frames;
   std::string init1(const VSMap *in, VSCore *core, const VSAPI *vsapi);
   std::string init2(const VSFrame *frame, VSCore *core, const VSAPI *vsapi);
-  void requestFrames(int n, VSFrameContext *frameCtx, const VSAPI *vsapi) const;
+  std::string requestFrames(int n, VSFrameContext *frameCtx, const VSAPI *vsapi);
   std::string prepareFrame(int n, VSFrameContext *frameCtx, const VSAPI *vsapi);
-  std::string extractFrame(int n, VSFrame *&frame, VSCore *core, const VSAPI *vsapi);
-  ~CycMuNetFilter();
+  std::string extractFrame(int n, const VSFrame *&frame, VSCore *core, const VSAPI *vsapi);
+  ~NNVISRFilter();
 
   std::string synchronize() {
     auto err = cudaStreamSynchronize(session->stream);
     if (err != cudaSuccess) {
-      return std::string("CycMuNet: failed synchronize CUDA stream: ") + cudaGetErrorName(cudaError_t(err)) + " (" +
+      return std::string("NNVISR: failed synchronize CUDA stream: ") + cudaGetErrorName(cudaError_t(err)) + " (" +
              cudaGetErrorString(cudaError_t(err)) + ").";
     }
 
@@ -201,44 +237,45 @@ class CycMuNetFilter {
   }
 };
 
-std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vsapi) {
+std::string NNVISRFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vsapi) {
   int err;
 
   logger = new Logger {core, vsapi->logMessage};
 
   // Get a clip reference from the input arguments. This must be freed later.
   node = vsapi->mapGetNode(in, "clip", 0, nullptr);
-  const VSVideoInfo *vi = vsapi->getVideoInfo(node);
-  num_frames = vi->numFrames;
-  scene_begin_index = 0;
-  scene_begin_index_pending = num_frames;
+  vi = *vsapi->getVideoInfo(node);
+  num_frames = vi.numFrames;
+  extract_begin = 0;
+  extract_end = 0;
+  end_of_scene = true;
+  last_output_frame = -1;
 
-  if (!vsh::isConstantVideoFormat(vi)) {
-    return "CycMuNet: only constant format input supported";
+  if (!vsh::isConstantVideoFormat(&vi)) {
+    return "NNVISR: only constant format input supported";
   }
 
   IOFormat format;
-  if (vi->format.colorFamily == VSColorFamily::cfRGB) {
+  if (vi.format.colorFamily == VSColorFamily::cfRGB) {
     format = IOFormat::RGB;
-    return "CycMuNet: RGB input unimplemented";
   }
-  else if (vi->format.colorFamily == VSColorFamily::cfYUV) {
-    if (vi->format.subSamplingH == 1 && vi->format.subSamplingW == 1) {
+  else if (vi.format.colorFamily == VSColorFamily::cfYUV) {
+    if (vi.format.subSamplingH == 1 && vi.format.subSamplingW == 1) {
       format = IOFormat::YUV420;
     }
     else {
-      return "CycMuNet: only support 4:2:0 for YUV IO";
+      return "NNVISR: only support 4:2:0 for YUV IO";
     }
   }
   else {
-    return "CycMuNet: only support RGB or YUV format";
+    return "NNVISR: only support RGB or YUV format";
   }
-  color_family = VSColorFamily(vi->format.colorFamily);
+  color_family = VSColorFamily(vi.format.colorFamily);
 
   std::array<float, 3> tmp {};
   err = getFloatArray("norm_mean", tmp, in, vsapi, default_norm_mean);
   if (err) {
-    return "CycMuNet: norm_mean should have 3 values";
+    return "NNVISR: norm_mean should have 3 values";
   }
   denorm.r.b = tmp[0];
   denorm.g.b = tmp[1];
@@ -246,18 +283,55 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
 
   err = getFloatArray("norm_std", tmp, in, vsapi, default_norm_std);
   if (err) {
-    return "CycMuNet: norm_std should have 3 values";
+    return "NNVISR: norm_std should have 3 values";
   }
   denorm.r.a = tmp[0];
   denorm.g.a = tmp[1];
   denorm.b.a = tmp[2];
 
-  auto batch_size = int32_t(vsapi->mapGetInt(in, "batch_size", 0, &err));
+  auto input_count = int32_t(vsapi->mapGetInt(in, "input_count", 0, &err));
   if (err) {
-    batch_size = 1;
+    input_count = 1;
   }
-  else if (batch_size < 1) {
-    return "CycMuNet: batch_size should >= 1";
+  else if (input_count < 1) {
+    return "NNVISR: input_count should >= 1";
+  }
+
+  auto feature_count = int32_t(vsapi->mapGetInt(in, "feature_count", 0, &err));
+  if (err) {
+    feature_count = 64;
+  }
+  else if (feature_count < 1) {
+    return "NNVISR: feature_count should >= 1";
+  }
+  else if (feature_count % 8 != 0) {
+    vsapi->logMessage(mtWarning, "NNVISR: feature_count not multiple of 8, this model can be inefficient.", core);
+  }
+
+  auto extraction_layers = int32_t(vsapi->mapGetInt(in, "extraction_layers", 0, &err));
+  if (err) {
+    extraction_layers = 1;
+  }
+  else if (extraction_layers < 1) {
+    return "NNVISR: extraction_layers should >= 1";
+  }
+
+  auto extra_frame = bool(vsapi->mapGetInt(in, "extra_frame", 0, &err));
+  if (err) {
+    extra_frame = false;
+  }
+
+  auto double_frame = bool(vsapi->mapGetInt(in, "double_frame", 0, &err));
+  if (err) {
+    double_frame = false;
+  }
+
+  bool interpolation = bool(vsapi->mapGetInt(in, "interpolation", 0, &err));
+  if (err) {
+    interpolation = double_frame || extra_frame;
+  }
+  if (double_frame && !interpolation) {
+    return "NNVISR: interpolation must be True if double_frame is True";
   }
 
   auto batch_size_fusion = int32_t(vsapi->mapGetInt(in, "batch_size_fusion", 0, &err));
@@ -265,27 +339,42 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
     batch_size_fusion = 1;
   }
   else if (batch_size_fusion < 1) {
-    return "CycMuNet: batch_size_fusion should >= 1";
+    return "NNVISR: batch_size_fusion should >= 1";
   }
-  else if (batch_size_fusion > batch_size) {
-    return "CycMuNet: batch_size_fusion should <= batch_size";
+
+  auto batch_size = int32_t(vsapi->mapGetInt(in, "batch_size", 0, &err));
+  if (err) {
+    batch_size = batch_size_fusion * (extra_frame ? (input_count - 1) : input_count);
   }
-  else if (batch_size % batch_size_fusion != 0) {
-    vsapi->logMessage(mtWarning, "CycMuNet: batch_size not multiple of batch_size_fusion, this can be inefficient.",
-                      core);
+  else if (batch_size < 1) {
+    return "NNVISR: batch_size should >= 1";
+  }
+
+  if (extra_frame) {
+    if (batch_size % (batch_size_fusion * (input_count - 1)) != 0) {
+      return "NNVISR: batch_size should be a multiple of batch_size_fusion * (input_count - 1)";
+    }
+  }
+  else {
+    if (batch_size % (batch_size_fusion * input_count) != 0) {
+      return "NNVISR: batch_size should be a multiple of batch_size_fusion * input_count";
+    }
   }
 
   auto scale_factor = float(vsapi->mapGetFloat(in, "scale_factor", 0, nullptr));
-  if (scale_factor <= 1) {
-    return "CycMuNet: scale_factor should > 1";
+  if (scale_factor <= 0) {
+    return "NNVISR: scale_factor should > 0";
   }
 
-  auto extraction_layers = int32_t(vsapi->mapGetInt(in, "extraction_layers", 0, &err));
+  auto scale_factor_h = float(vsapi->mapGetFloat(in, "scale_factor_h", 0, &err));
   if (err) {
-    extraction_layers = 4;
+    scale_factor_h = scale_factor;
   }
-  else if (extraction_layers < 1) {
-    return "CycMuNet: extraction_layers should >= 1";
+  else if (scale_factor_h <= 0) {
+    return "NNVISR: scale_factor_h should > 0";
+  }
+  if (interpolation && !double_frame && (scale_factor != 1 || scale_factor_h != 1)) {
+    return "NNVISR: if interpolation not producing double_frame, scale_factor must be 1";
   }
 
   auto use_fp16 = bool(vsapi->mapGetInt(in, "use_fp16", 0, &err));
@@ -298,13 +387,13 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
     raw_norm = false;
   }
 
-  model_path = vsapi->mapGetData(in, "model_path", 0, &err);
+  model_path = safe_cstr(vsapi->mapGetData(in, "model_path", 0, &err));
   if (err) {
-    model_path = vsapi->getPluginPath(vsapi->getPluginByID("dev.tyty.aim.cycmunet", core));
-    model_path = model_path.remove_filename() / "dev.tyty.aim.cycmunet";
+    model_path = vsapi->getPluginPath(vsapi->getPluginByID("dev.tyty.aim.NNVISR", core));
+    model_path = model_path.remove_filename() / "dev.tyty.aim.NNVISR";
   }
 
-  std::string model_name = vsapi->mapGetData(in, "model", 0, &err);
+  std::string model_name = safe_cstr(vsapi->mapGetData(in, "model", 0, &err));
   if (err) {
     model = ".";
   }
@@ -317,27 +406,35 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
     low_mem = false;
   }
 
-  config = {int32_t(vi->width),
-            int32_t(vi->height),
-            batch_size,
-            batch_size_fusion,
-            64,
-            scale_factor,
-            format,
-            extraction_layers,
-            use_fp16,
-            low_mem};
-
-  vo = *vi;
+  config = {int32_t(vi.width), int32_t(vi.height), batch_size,  batch_size_fusion, input_count,
+            feature_count,      extraction_layers,   extra_frame, double_frame,      interpolation,
+            scale_factor,       scale_factor_h,      format,      use_fp16,          low_mem};
+  
+  vo = vi;
   vo.width = int(double(scale_factor) * vo.width);
-  vo.height = int(double(scale_factor) * vo.height);
-  vo.numFrames *= 2;
-  vo.fpsNum *= 2;
-  vsh::reduceRational(&vo.fpsNum, &vo.fpsDen);
+  vo.height = int(double(scale_factor_h) * vo.height);
+  if (interpolation) {
+    vo.numFrames *= 2;
+    vo.fpsNum *= 2;
+    vsh::reduceRational(&vo.fpsNum, &vo.fpsDen);
+  }
+  
+  auto out_format = vsapi->mapGetInt(in, "out_format", 0, &err);
+  if (!err) {
+    if (!vsapi->getVideoFormatByID(&vo.format, out_format, core)) {
+      return "NNVISR: invalid out_format";
+    }
+    
+    if (vo.format.colorFamily != vi.format.colorFamily ||
+        vo.format.subSamplingW != vi.format.subSamplingW ||
+        vo.format.subSamplingH != vi.format.subSamplingH) {
+      return "NNVISR: incompatible out_format: Mistach color family or chroma subsampling";
+    }
+  }
 
   if (color_family == VSColorFamily::cfRGB) {
-    size_t input_y_size = alignment((size_t) vi->width * vi->height * vi->format.bytesPerSample, 4096);
-    input_shape_y = {vi->height, vi->width};
+    size_t input_y_size = alignment((size_t) vi.width * vi.height * vi.format.bytesPerSample, 4096);
+    input_shape_y = {vi.height, vi.width};
     input_tensor_y = {config.input_height, config.input_width};
 
     size_t output_y_size = alignment((size_t) vo.width * vo.height * vo.format.bytesPerSample, 4096);
@@ -347,14 +444,14 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
 
     err = cudaMalloc((void **) &ioBuffer[0], 3 * input_y_size);
     if (err != cudaSuccess) {
-      return "CycMuNet: failed alloc " + std::to_string(3 * input_y_size) +
+      return "NNVISR: failed alloc " + std::to_string(3 * input_y_size) +
              " bytes of CUDA memory: " + cudaGetErrorName(cudaError_t(err)) + " (" +
              cudaGetErrorString(cudaError_t(err)) + ").";
     }
 
     err = cudaMalloc((void **) &ioBuffer[1], 3 * output_y_size);
     if (err != cudaSuccess) {
-      return "CycMuNet: failed alloc " + std::to_string(3 * output_y_size) +
+      return "NNVISR: failed alloc " + std::to_string(3 * output_y_size) +
              " bytes of CUDA memory: " + cudaGetErrorName(cudaError_t(err)) + " (" +
              cudaGetErrorString(cudaError_t(err)) + ").";
     }
@@ -367,11 +464,11 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
     ioPointer[5] = ioBuffer[1] + 2 * output_y_size;
   }
   else {
-    size_t input_y_size = alignment((size_t) vi->width * vi->height * vi->format.bytesPerSample, 4096);
-    int32_t input_uv_width = (vi->width + (1 << vi->format.subSamplingW) - 1) >> vi->format.subSamplingW;
-    int32_t input_uv_height = (vi->height + (1 << vi->format.subSamplingH) - 1) >> vi->format.subSamplingH;
-    size_t input_uv_size = alignment((size_t) input_uv_width * input_uv_height * vi->format.bytesPerSample, 4096);
-    input_shape_y = {vi->height, vi->width};
+    size_t input_y_size = alignment((size_t) vi.width * vi.height * vi.format.bytesPerSample, 4096);
+    int32_t input_uv_width = (vi.width + (1 << vi.format.subSamplingW) - 1) >> vi.format.subSamplingW;
+    int32_t input_uv_height = (vi.height + (1 << vi.format.subSamplingH) - 1) >> vi.format.subSamplingH;
+    size_t input_uv_size = alignment((size_t) input_uv_width * input_uv_height * vi.format.bytesPerSample, 4096);
+    input_shape_y = {vi.height, vi.width};
     input_shape_uv = {input_uv_height, input_uv_width};
     input_tensor_y = {config.input_height, config.input_width};
     input_tensor_uv = {(input_tensor_y[0] + (1 << vo.format.subSamplingH) - 1) >> vo.format.subSamplingH,
@@ -390,14 +487,14 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
 
     err = cudaMalloc((void **) &ioBuffer[0], input_y_size + 2 * input_uv_size);
     if (err != cudaSuccess) {
-      return "CycMuNet: failed alloc " + std::to_string(input_y_size + 2 * input_uv_size) +
+      return "NNVISR: failed alloc " + std::to_string(input_y_size + 2 * input_uv_size) +
              " bytes of CUDA memory: " + cudaGetErrorName(cudaError_t(err)) + " (" +
              cudaGetErrorString(cudaError_t(err)) + ").";
     }
 
     err = cudaMalloc((void **) &ioBuffer[1], output_y_size + 2 * output_uv_size);
     if (err != cudaSuccess) {
-      return "CycMuNet: failed alloc " + std::to_string(output_y_size + 2 * output_uv_size) +
+      return "NNVISR: failed alloc " + std::to_string(output_y_size + 2 * output_uv_size) +
              " bytes of CUDA memory: " + cudaGetErrorName(cudaError_t(err)) + " (" +
              cudaGetErrorString(cudaError_t(err)) + ").";
     }
@@ -410,18 +507,18 @@ std::string CycMuNetFilter::init1(const VSMap *in, VSCore *core, const VSAPI *vs
     ioPointer[5] = ioBuffer[1] + output_y_size + output_uv_size;
   }
 
-  requested_frames = std::vector<const VSFrame *> {size_t(config.batch_extract + 1), nullptr};
+  requested_frames = std::vector<const VSFrame *> {size_t(config.batch_extract + int(config.extra_frame)), nullptr};
   return "";
 }
 
-std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAPI *vsapi) {
+std::string NNVISRFilter::init2(const VSFrame *frame, VSCore *core, const VSAPI *vsapi) {
   auto frame_prop = vsapi->getFramePropertiesRO(frame);
   first_frame = frame;
   int err;
 
   color_space_t def, cur;
   if (color_family == VSColorFamily::cfRGB) {
-    def = {VSC_PRIMARIES_BT709, VSC_TRANSFER_IEC_61966_2_1, VSC_MATRIX_RGB, VSC_RANGE_FULL};
+    def = {VSC_PRIMARIES_BT709, VSC_TRANSFER_BT709, VSC_MATRIX_RGB, VSC_RANGE_FULL};
   }
   else {
     def = {VSC_PRIMARIES_BT709, VSC_TRANSFER_BT709, VSC_MATRIX_BT709, VSC_RANGE_LIMITED};
@@ -432,25 +529,32 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
     cur.r = def.r;
   }
   else if (cur.r > VSC_RANGE_LIMITED || cur.r < VSC_RANGE_FULL) {
-    vsapi->logMessage(mtWarning, "CycMuNet: input has invalid color range. Assuming default color range.", core);
+    vsapi->logMessage(mtWarning, "NNVISR: input has invalid color range. Assuming default color range.", core);
     cur.r = def.r;
   }
 
   cur.cp = VSColorPrimaries(vsapi->mapGetInt(frame_prop, "_Primaries", 0, &err));
   if (err) {
-    cur.cp = def.cp;
+    cur.cp = VSC_PRIMARIES_UNSPECIFIED;
   }
   switch (cur.cp) {
-    case VSC_PRIMARIES_UNSPECIFIED: cur.cp = def.cp; break;
+    case VSC_PRIMARIES_UNSPECIFIED:
+      vsapi->logMessage(mtWarning, "NNVISR: input color primaries unspecified. Assuming default (BT.709).", core);
+      cur.cp = def.cp;
+      break;
     case VSC_PRIMARIES_ST240_M: cur.cp = VSC_PRIMARIES_ST170_M; break;
   }
 
   cur.tc = VSTransferCharacteristics(vsapi->mapGetInt(frame_prop, "_Transfer", 0, &err));
   if (err) {
-    cur.tc = def.tc;
+    cur.tc = VSC_TRANSFER_UNSPECIFIED;
   }
   switch (cur.tc) {
-    case VSC_TRANSFER_UNSPECIFIED: cur.tc = def.tc; break;
+    case VSC_TRANSFER_UNSPECIFIED:
+      vsapi->logMessage(mtWarning, "NNVISR: input transfer characteristic unspecified. Assuming default (BT.709).",
+                        core);
+      cur.tc = def.tc;
+      break;
     case VSC_TRANSFER_BT601:
     case VSC_TRANSFER_BT2020_10:
     case VSC_TRANSFER_BT2020_12: cur.tc = VSC_TRANSFER_BT709; break;
@@ -458,16 +562,17 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
 
   cur.mc = VSMatrixCoefficients(vsapi->mapGetInt(frame_prop, "_Matrix", 0, &err));
   if (err || cur.mc == VSC_MATRIX_UNSPECIFIED) {
+    vsapi->logMessage(mtWarning, "NNVISR: input matrix coefficient unspecified. Assuming default (BT.709).", core);
     cur.mc = def.mc;
   }
   if (color_family == VSColorFamily::cfRGB && cur.mc != VSC_MATRIX_RGB) {
-    vsapi->logMessage(mtWarning, "CycMuNet: RGB input must uses RGB Matrix.", core);
+    vsapi->logMessage(mtWarning, "NNVISR: RGB input must uses RGB Matrix.", core);
     cur.mc = VSC_MATRIX_RGB;
   }
   else if (color_family == VSColorFamily::cfYUV) {
     switch (cur.mc) {
       case VSC_MATRIX_RGB:
-        vsapi->logMessage(mtWarning, "CycMuNet: YUV input must not use RGB Matrix, reset to default.", core);
+        vsapi->logMessage(mtWarning, "NNVISR: YUV input must not use RGB Matrix, reset to default (BT.709).", core);
         cur.mc = def.mc;
       case VSC_MATRIX_BT470_BG: cur.mc = VSC_MATRIX_ST170_M; break;
       case VSC_MATRIX_CHROMATICITY_DERIVED_NCL:
@@ -481,28 +586,33 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
 
   std::string colorspace_folder;
   if (vo.format.colorFamily == VSColorFamily::cfRGB) {
-    std::stringstream ss {"rgb_"};
-    ss << cur.cp << '_' << cur.tc;
+    std::stringstream ss;
+    ss << "rgb_" << cur.cp << '_' << cur.tc;
     colorspace_folder = ss.str();
   }
   else {
-    std::stringstream ss {"yuv_"};
-    ss << cur.cp << '_' << cur.tc << '_' << cur.mc;
+    std::stringstream ss;
+    ss << "yuv_" << cur.cp << '_' << cur.tc << '_' << cur.mc;
     colorspace_folder = ss.str();
   }
 
   ctx = new InferenceContext {config, *logger, model_path / "engines" / model / colorspace_folder};
 
   if (!ctx->has_file()) {
-    vsapi->logMessage(mtInformation, "CycMuNet: building engine. This will take some time.", core);
+    vsapi->logMessage(mtInformation, "NNVISR: building engine for current resolution. This will take some time.", core);
     OptimizationContext optimize_ctx {{config.input_width,
                                        config.input_height,
                                        {1, config.batch_extract, config.batch_extract},
                                        {1, config.batch_fusion, config.batch_fusion},
+                                       config.input_count,
                                        config.feature_count,
-                                       config.scale_factor,
-                                       config.format,
                                        config.extraction_layers,
+                                       config.extra_frame,
+                                       config.double_frame,
+                                       config.interpolation,
+                                       config.scale_factor_w,
+                                       config.scale_factor_h,
+                                       config.format,
                                        config.use_fp16,
                                        config.low_mem},
                                       *logger,
@@ -510,15 +620,15 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
 
     err = optimize_ctx.optimize(model / colorspace_folder);
     if (err) {
-      return "CycMuNet: failed building engine for current input dimension";
+      return "NNVISR: failed building engine for current input dimension";
     }
-    vsapi->logMessage(mtInformation, "CycMuNet: done building engine.", core);
+    vsapi->logMessage(mtInformation, "NNVISR: done building engine.", core);
   }
 
   if (!ctx->load_engine()) {
     delete ctx;
     delete logger;
-    return "CycMuNet: failed init context";
+    return "NNVISR: failed init context";
   }
 
   session = new InferenceSession {*ctx};
@@ -526,7 +636,7 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
     delete session;
     delete ctx;
     delete logger;
-    return "CycMuNet: failed init session";
+    return "NNVISR: failed init session";
   }
 
   if (raw_norm) {
@@ -539,8 +649,8 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
     auto isFloat = vo.format.sampleType == VSSampleType::stFloat;
     auto depth = isFloat ? 8 : vo.format.bitsPerSample;
     if (isFloat && cur.r == VSColorRange::VSC_RANGE_LIMITED) {
-      vsapi->logMessage(
-          mtWarning, "CycMuNet: Normalization value for limited range floating point input may be inaccurate.", core);
+      vsapi->logMessage(mtWarning,
+                        "NNVISR: Normalization value for limited range floating point input may be inaccurate.", core);
     }
 
     if (color_family == VSColorFamily::cfYUV) {
@@ -556,7 +666,7 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
         }
 
         if (pPrimaries == nullptr) {
-          vsapi->logMessage(mtWarning, "CycMuNet: unknown color primary. Assume default (BT.709).", core);
+          vsapi->logMessage(mtWarning, "NNVISR: unknown color primary. Assume default (BT.709).", core);
           pPrimaries = colorPrimariesTable[0].primaries;
         }
 
@@ -582,7 +692,7 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
         }
 
         if (!found) {
-          return "CycMuNet: unsupported matrix coefficient, can not infer normalization parameter.";
+          return "NNVISR: unsupported matrix coefficient, can not infer normalization parameter.";
         }
       }
 
@@ -637,16 +747,17 @@ std::string CycMuNetFilter::init2(const VSFrame *frame, VSCore *core, const VSAP
 }
 
 template<class F, class U>
-std::string CycMuNetFilter::readPlane(md_view<F, 2> dst, md_uview<const U, 2> src, md_view<U, 2> cuda_tmp, float a,
-                                      float b) {
+std::string NNVISRFilter::readPlane(md_view<F, 2> dst, md_uview<const U, 2> src, md_view<U, 2> cuda_tmp, float a,
+                                    float b) {
   int err;
   if (src.is_contiguous()) {
     auto src_c = src.as_view();
 
     err = cudaMemcpyAsync(cuda_tmp.data, src_c.data, cuda_tmp.size() * sizeof(U), cudaMemcpyHostToDevice,
                           session->stream);
+    err = err ? err : cudaStreamSynchronize(session->stream);
     if (err != cudaSuccess) {
-      return "CycMuNet: failed copy " + std::to_string(cuda_tmp.size() * sizeof(U)) +
+      return "NNVISR: failed copy " + std::to_string(cuda_tmp.size() * sizeof(U)) +
              " bytes of CUDA memory: " + cudaGetErrorName(cudaError_t(err)) + " (" +
              cudaGetErrorString(cudaError_t(err)) + ").";
     }
@@ -656,8 +767,9 @@ std::string CycMuNetFilter::readPlane(md_view<F, 2> dst, md_uview<const U, 2> sr
       auto line = cuda_tmp.at(i);
       err =
           cudaMemcpyAsync(line.data, src.at(i).data, line.size() * sizeof(U), cudaMemcpyHostToDevice, session->stream);
+      err = err ? err : cudaStreamSynchronize(session->stream);
       if (err != cudaSuccess) {
-        return "CycMuNet: failed copy " + std::to_string(line.size() * sizeof(U)) +
+        return "NNVISR: failed copy " + std::to_string(line.size() * sizeof(U)) +
                " bytes of CUDA memory: " + cudaGetErrorName(cudaError_t(err)) + " (" +
                cudaGetErrorString(cudaError_t(err)) + ").";
       }
@@ -665,12 +777,14 @@ std::string CycMuNetFilter::readPlane(md_view<F, 2> dst, md_uview<const U, 2> sr
   }
 
   import_pixel<F, U>(dst, cuda_tmp, a, b, session->stream);
+  trace("put input " + describe(dst));
   return "";
 }
 
 template<class F, class U>
-std::string CycMuNetFilter::writePlane(md_uview<U, 2> dst, md_view<const F, 2> src, md_view<U, 2> cuda_tmp, float a,
-                                       float b, float min, float max) {
+std::string NNVISRFilter::writePlane(md_uview<U, 2> dst, md_view<const F, 2> src, md_view<U, 2> cuda_tmp, float a,
+                                     float b, float min, float max) {
+    trace("get output " + describe(src));
   export_pixel<F, U>(cuda_tmp, src, a, b, min, max, session->stream);
 
   int err;
@@ -679,7 +793,7 @@ std::string CycMuNetFilter::writePlane(md_uview<U, 2> dst, md_view<const F, 2> s
 
     err = cudaMemcpyAsync(dst_c.data, cuda_tmp.data, dst_c.size() * sizeof(U), cudaMemcpyDeviceToHost, session->stream);
     if (err != cudaSuccess) {
-      return "CycMuNet: failed copy " + std::to_string(dst_c.size() * sizeof(U)) +
+      return "NNVISR: failed copy " + std::to_string(dst_c.size() * sizeof(U)) +
              " bytes of CUDA memory: " + cudaGetErrorName(cudaError_t(err)) + " (" +
              cudaGetErrorString(cudaError_t(err)) + ").";
     }
@@ -690,7 +804,7 @@ std::string CycMuNetFilter::writePlane(md_uview<U, 2> dst, md_view<const F, 2> s
       err =
           cudaMemcpyAsync(dst.at(i).data, line.data, line.size() * sizeof(U), cudaMemcpyDeviceToHost, session->stream);
       if (err != cudaSuccess) {
-        return "CycMuNet: failed copy " + std::to_string(line.size() * sizeof(U)) +
+        return "NNVISR: failed copy " + std::to_string(line.size() * sizeof(U)) +
                " bytes of CUDA memory: " + cudaGetErrorName(cudaError_t(err)) + " (" +
                cudaGetErrorString(cudaError_t(err)) + ").";
       }
@@ -701,7 +815,7 @@ std::string CycMuNetFilter::writePlane(md_uview<U, 2> dst, md_view<const F, 2> s
 }
 
 template<class U>
-std::string CycMuNetFilter::readYUV(offset_t position, const VSFrame *frame, const VSAPI *vsapi) {
+std::string NNVISRFilter::uploadYUV(offset_t position, const VSFrame *frame, const VSAPI *vsapi) {
   auto bps = vo.format.bytesPerSample;
   md_uview<const U, 2> input_planes[3] = {
       {reinterpret_cast<const U *>(vsapi->getReadPtr(frame, 0)), input_shape_y, {vsapi->getStride(frame, 0) / bps, 1}},
@@ -712,21 +826,17 @@ std::string CycMuNetFilter::readYUV(offset_t position, const VSFrame *frame, con
   md_view<U, 2> input_tmps[3] = {{reinterpret_cast<U *>(ioPointer[0]), input_shape_y},
                                  {reinterpret_cast<U *>(ioPointer[1]), input_shape_uv},
                                  {reinterpret_cast<U *>(ioPointer[2]), input_shape_uv}};
-  md_view<uint8_t, 2> y_tensor {static_cast<uint8_t *>(session->input[0]),
-                                {config.batch_extract, offset_t(session->input_size())}};
-  md_view<uint8_t, 3> uv_tensor {static_cast<uint8_t *>(session->input[1]),
-                                 {config.batch_extract, 2, offset_t(session->input_size() / 4)}};
 
   for (int i = 0; i < 3; ++i) {
     shape_t<2> dim;
     uint8_t *tensor_ptr;
     if (i == 0) {
       dim = input_tensor_y;
-      tensor_ptr = y_tensor.at(position).data;
+      tensor_ptr = session->input.at(position, 0).data;
     }
     else {
       dim = input_tensor_uv;
-      tensor_ptr = uv_tensor.at(position, i - 1).data;
+      tensor_ptr = session->input_uv.at(position, i - 1).data;
     }
 
     std::string result;
@@ -746,7 +856,7 @@ std::string CycMuNetFilter::readYUV(offset_t position, const VSFrame *frame, con
 }
 
 template<class U>
-std::string CycMuNetFilter::readRGB(offset_t position, const VSFrame *frame, const VSAPI *vsapi) {
+std::string NNVISRFilter::uploadRGB(offset_t position, const VSFrame *frame, const VSAPI *vsapi) {
   auto bps = vo.format.bytesPerSample;
   md_uview<const U, 2> input_planes[3] = {
       {reinterpret_cast<const U *>(vsapi->getReadPtr(frame, 0)), input_shape_y, {vsapi->getStride(frame, 0) / bps, 1}},
@@ -755,11 +865,9 @@ std::string CycMuNetFilter::readRGB(offset_t position, const VSFrame *frame, con
   md_view<U, 2> input_tmps[3] = {{reinterpret_cast<U *>(ioPointer[0]), input_shape_y},
                                  {reinterpret_cast<U *>(ioPointer[1]), input_shape_y},
                                  {reinterpret_cast<U *>(ioPointer[2]), input_shape_y}};
-  md_view<uint8_t, 3> rgb_tensor {static_cast<uint8_t *>(session->input[0]),
-                                  {config.batch_extract, 3, offset_t(session->input_size())}};
 
   for (int i = 0; i < 3; ++i) {
-    uint8_t *tensor_ptr = rgb_tensor.at(i).data;
+    uint8_t *tensor_ptr = session->input.at(position, i).data;
 
     std::string result;
     if (config.use_fp16) {
@@ -779,7 +887,7 @@ std::string CycMuNetFilter::readRGB(offset_t position, const VSFrame *frame, con
 }
 
 template<class U>
-std::string CycMuNetFilter::writeYUV(offset_t position, VSFrame *frame, const VSAPI *vsapi) {
+std::string NNVISRFilter::downloadYUV(offset_t position, VSFrame *frame, const VSAPI *vsapi) {
   auto bps = vo.format.bytesPerSample;
   md_uview<U, 2> output_planes[3] = {
       {reinterpret_cast<U *>(vsapi->getWritePtr(frame, 0)), output_shape_y, {vsapi->getStride(frame, 0) / bps, 1}},
@@ -788,22 +896,9 @@ std::string CycMuNetFilter::writeYUV(offset_t position, VSFrame *frame, const VS
   md_view<U, 2> output_tmps[3] = {{reinterpret_cast<U *>(ioPointer[3]), output_shape_y},
                                   {reinterpret_cast<U *>(ioPointer[4]), output_shape_uv},
                                   {reinterpret_cast<U *>(ioPointer[5]), output_shape_uv}};
-  int32_t y_idx, uv_idx;
-  if (position % 2 == 0) {
-    y_idx = 0;
-    uv_idx = 1;
-  }
-  else {
-    y_idx = 2;
-    uv_idx = 3;
-  }
 
-  position /= 2;
-
-  md_view<uint8_t, 2> y_tensor {static_cast<uint8_t *>(session->output[y_idx]),
-                                {config.batch_fusion, offset_t(session->output_size())}};
-  md_view<uint8_t, 3> uv_tensor {static_cast<uint8_t *>(session->output[uv_idx]),
-                                 {config.batch_fusion, 2, offset_t(session->output_size() / 4)}};
+  auto idx = session->outputIndex(position);
+  //  trace("output position " + std::to_string(position) + " is " + describe(idx));
 
   for (int i = 0; i < 3; ++i) {
     shape_t<2> dim;
@@ -811,13 +906,13 @@ std::string CycMuNetFilter::writeYUV(offset_t position, VSFrame *frame, const VS
     float min, max;
     if (i == 0) {
       dim = output_tensor_y;
-      tensor_ptr = y_tensor.at(position).data;
+      tensor_ptr = session->output.at(idx).at(0).data;
       min = y_min;
       max = y_max;
     }
     else {
       dim = output_tensor_uv;
-      tensor_ptr = uv_tensor.at(position, i - 1).data;
+      tensor_ptr = session->output_uv.at(idx).at(i - 1).data;
       min = uv_min;
       max = uv_max;
     }
@@ -840,7 +935,7 @@ std::string CycMuNetFilter::writeYUV(offset_t position, VSFrame *frame, const VS
 }
 
 template<class U>
-std::string CycMuNetFilter::writeRGB(offset_t position, VSFrame *frame, const VSAPI *vsapi) {
+std::string NNVISRFilter::downloadRGB(offset_t position, VSFrame *frame, const VSAPI *vsapi) {
   auto bps = vo.format.bytesPerSample;
   md_uview<U, 2> output_planes[3] = {
       {reinterpret_cast<U *>(vsapi->getWritePtr(frame, 0)), output_shape_y, {vsapi->getStride(frame, 0) / bps, 1}},
@@ -849,20 +944,21 @@ std::string CycMuNetFilter::writeRGB(offset_t position, VSFrame *frame, const VS
   md_view<U, 2> output_tmps[3] = {{reinterpret_cast<U *>(ioPointer[3]), output_shape_y},
                                   {reinterpret_cast<U *>(ioPointer[4]), output_shape_y},
                                   {reinterpret_cast<U *>(ioPointer[5]), output_shape_y}};
-  md_view<uint8_t, 2> y_tensor {static_cast<uint8_t *>(session->output[position % 2]),
-                                {config.batch_fusion, offset_t(session->output_size())}};
 
-  position /= 2;
+  auto idx = session->outputIndex(position);
+  //  trace("output position " + std::to_string(position) + " is " + describe(idx));
 
   for (int i = 0; i < 3; ++i) {
+    uint8_t *tensor_ptr = session->output.at(idx).at(i).data;
+
     std::string result;
     if (config.use_fp16) {
-      result = writePlane<half, U>(output_planes[i], {(half *) y_tensor.at(position).data, output_tensor_y},
-                                   output_tmps[i], denorm.z[i].a, denorm.z[i].b, y_min, y_max);
+      result = writePlane<half, U>(output_planes[i], {(half *) tensor_ptr, output_tensor_y}, output_tmps[i],
+                                   denorm.z[i].a, denorm.z[i].b, y_min, y_max);
     }
     else {
-      result = writePlane<float, U>(output_planes[i], {(float *) y_tensor.at(position).data, output_tensor_y},
-                                    output_tmps[i], denorm.z[i].a, denorm.z[i].b, y_min, y_max);
+      result = writePlane<float, U>(output_planes[i], {(float *) tensor_ptr, output_tensor_y}, output_tmps[i],
+                                    denorm.z[i].a, denorm.z[i].b, y_min, y_max);
     }
     if (!result.empty()) {
       return result;
@@ -872,205 +968,407 @@ std::string CycMuNetFilter::writeRGB(offset_t position, VSFrame *frame, const VS
   return "";
 }
 
-void CycMuNetFilter::requestFrames(int n, VSFrameContext *frameCtx, const VSAPI *vsapi) const {
-  auto request = [&](int i) { vsapi->requestFrameFilter(i, node, frameCtx); };
-  //  auto request = [&](int i) {
-  //    vsapi->requestFrameFilter(i, node, frameCtx);
-  //    logger->log(nvinfer1::ILogger::Severity::kWARNING, "Requesting f #" + std::to_string(i));
-  //  };
+std::string NNVISRFilter::requestFrames(int n, VSFrameContext *frameCtx, const VSAPI *vsapi) {
+  //  auto request = [&](int i) { vsapi->requestFrameFilter(i, node, frameCtx); };
+  auto request = [&](int i) {
+//        trace("requesting in frame #" + std::to_string(i));
+    vsapi->requestFrameFilter(i, node, frameCtx);
+  };
 
-  // Get the index of the first frame of current scene
-  auto scene_begin_index_current = n / 2 >= scene_begin_index_pending ? scene_begin_index_pending : scene_begin_index;
-  auto scene_begin_index_next = n / 2 >= scene_begin_index_pending ? num_frames : scene_begin_index_pending;
+  if (last_output_frame + 1 != n) {
+    return "NNVISR: unexpected request: non-linear frame request, requesting " + std::to_string(n) + " after " +
+           std::to_string(last_output_frame);
+  }
+  last_output_frame = n;
 
-  if (n / 2 == scene_begin_index_current && n % 2 == 0) {
-    request(scene_begin_index_current);
+  start_of_batch = false;
+  start_of_scene = false;
+
+  auto m = config.interpolation ? n / 2 : n;
+  if (config.interpolation && n % 2 == 1) {
+    request(last_requested_frame);
+    return "";
   }
 
-  int begin = n / 2 + 1;
-  auto batch_begin = n - ((n - 2 * scene_begin_index_current) % (2 * config.batch_extract));
-  int end = std::min((batch_begin / 2 + 1) + config.batch_extract, scene_begin_index_next);
-  if (n == batch_begin && begin != end) {
-    for (int i = begin; i < end; ++i) {
-      request(i);
+  if (config.extra_frame) {
+    if (end_of_scene) {
+      start_of_batch = m == extract_end;// open range
+      start_of_scene = start_of_batch;
+    }
+    else {
+      start_of_batch = extract_end != num_frames && m + 1 == extract_end;// one extra frame is consumed
+      // [     )
+      // {* *}
+      // 0 1 2 3 4 5
+      //     [     )
+      //     {* *}
+      // at m = 2, last batch consumed 0,1,2 so consumed_end = 3.
+      // this batch will reuse 2 and consume 3,4
     }
   }
   else {
-    // Have to at least request one frame
-    request(end - 1);
+    start_of_batch = m == extract_end;
+    start_of_scene = start_of_batch && end_of_scene;
   }
+  end_of_scene = false;
+  //  if (start_of_scene) {
+  //    trace("Start of scene at out frame " + std::to_string(n));
+  //  }
+
+  if (!start_of_batch) {
+    request(last_requested_frame);
+    return "";
+  }
+
+  extract_begin = extract_end;
+  auto count = config.batch_extract;
+  if (start_of_scene && config.extra_frame) {
+    ++count;
+  }
+  extract_end = std::min(num_frames, extract_begin + count);
+  //  trace("SOB out frame " + std::to_string(n) + ", SOC: " + std::to_string(start_of_scene) + ", requesting " +
+  //        std::to_string(extract_begin) + "-" + std::to_string(extract_end));
+  if (extract_begin == extract_end) {
+    // extra_frame mode, last frame was consumed by last batch
+    assert(extract_begin != 0);
+    --extract_begin;
+  }
+  for (int32_t i = extract_begin; i < extract_end; ++i) {
+    request(i);
+  }
+  last_requested_frame = extract_end - 1;
+  fusion_in_begin = extract_begin;
+
+  return "";
 }
 
-std::string CycMuNetFilter::prepareFrame(int n, VSFrameContext *frameCtx, const VSAPI *vsapi) {
+std::string NNVISRFilter::prepareFrame(int n, VSFrameContext *frameCtx, const VSAPI *vsapi) {
+  auto getFrame = [&, this](int k) {
+    auto frame = k == 0 ? first_frame : vsapi->getFrameFilter(k, node, frameCtx);
+//        trace("acquire in frame #" + std::to_string(k));
+    return frame;
+  };
   auto loadFrameAt = [&](const VSFrame *frame_in, int32_t offset) -> std::string {
     if (color_family == VSColorFamily::cfRGB) {
-      if (vo.format.sampleType == VSSampleType::stFloat) {
-        if (vo.format.bytesPerSample == 2) {
-          return readRGB<half>(offset, frame_in, vsapi);
+      if (vi.format.sampleType == VSSampleType::stFloat) {
+        if (vi.format.bytesPerSample == 2) {
+          return uploadRGB<half>(offset, frame_in, vsapi);
         }
-        else if (vo.format.bytesPerSample == 4) {
-          return readRGB<float>(offset, frame_in, vsapi);
+        else if (vi.format.bytesPerSample == 4) {
+          return uploadRGB<float>(offset, frame_in, vsapi);
         }
-      } else {
-        if (vo.format.bytesPerSample == 1) {
-          return readRGB<uint8_t>(offset, frame_in, vsapi);
+      }
+      else {
+        if (vi.format.bytesPerSample == 1) {
+          return uploadRGB<uint8_t>(offset, frame_in, vsapi);
         }
-        else if (vo.format.bytesPerSample == 2) {
-          return readRGB<uint16_t>(offset, frame_in, vsapi);
+        else if (vi.format.bytesPerSample == 2) {
+          return uploadRGB<uint16_t>(offset, frame_in, vsapi);
         }
       }
     }
     else {
-      if (vo.format.sampleType == VSSampleType::stFloat) {
-        if (vo.format.bytesPerSample == 2) {
-          return readYUV<half>(offset, frame_in, vsapi);
+      if (vi.format.sampleType == VSSampleType::stFloat) {
+        if (vi.format.bytesPerSample == 2) {
+          return uploadYUV<half>(offset, frame_in, vsapi);
         }
-        else if (vo.format.bytesPerSample == 4) {
-          return readYUV<float>(offset, frame_in, vsapi);
+        else if (vi.format.bytesPerSample == 4) {
+          return uploadYUV<float>(offset, frame_in, vsapi);
         }
       } else {
-        if (vo.format.bytesPerSample == 1) {
-          return readYUV<uint8_t>(offset, frame_in, vsapi);
+        if (vi.format.bytesPerSample == 1) {
+          return uploadYUV<uint8_t>(offset, frame_in, vsapi);
         }
-        else if (vo.format.bytesPerSample == 2) {
-          return readYUV<uint16_t>(offset, frame_in, vsapi);
+        else if (vi.format.bytesPerSample == 2) {
+          return uploadYUV<uint16_t>(offset, frame_in, vsapi);
         }
       }
 
-      return "CycMuNet: unexpected format";
+      return "NNVISR: unexpected format";
     }
 
     return "";
   };
 
-  if (n % 2 == 1) {
+  auto m = config.interpolation ? n / 2 : n;
+  if (config.interpolation && n % 2 == 1) {
     return "";
   }
 
-  int input_index = n / 2;
-  if (input_index == scene_begin_index_pending) {
-    scene_begin_index = scene_begin_index_pending;
-    scene_begin_index_pending = num_frames;
-  }
-  int extract_index = (input_index - scene_begin_index) % config.batch_extract;
-  std::string result;
-
-  // an extract batch starts at this frame
-  if (extract_index == 0) {
-    // special logic at first frame of scene
-    if (input_index == scene_begin_index) {
-      session->extractBatch(0, 0, 1);
-      requested_frames[0] = first_frame;
-      loadFrameAt(requested_frames[0], 0);
-      session->extract();
-    }
-    else {
-      session->duplicateExtractOutput(config.batch_extract, 0);
-      requested_frames[0] = requested_frames[config.batch_extract];
-      requested_frames[config.batch_extract] = nullptr;
+  if (start_of_batch) {
+    int loaded_frames = 0;
+    int recycle_frames = 0;
+    // handle extra_frame
+    if (config.extra_frame) {
+      if (start_of_scene) {
+        assert(m == extract_begin);
+        requested_frames[0] = getFrame(extract_begin);
+        ++loaded_frames;
+        int err;// ignore key absent error: no scene change info is not critical
+        if (vsapi->mapGetInt(vsapi->getFramePropertiesRO(requested_frames[0]), "_SceneChangePrev", 0, &err)) {
+          end_of_scene = true;
+          extract_end = extract_begin + 1;
+        }
+      }
+      else {
+        recycle_frames = 1;
+      }
     }
 
-    int begin = input_index + 1;
-    int end = std::min(begin + config.batch_extract, num_frames);
-    session->extractBatch(0, 1, config.batch_extract);
-    for (loaded_frames = 0; loaded_frames < end - begin; ++loaded_frames) {
-      auto frame_in = vsapi->getFrameFilter(begin + loaded_frames, node, frameCtx);
+    for (; loaded_frames < extract_end - extract_begin; ++loaded_frames) {
+      auto frame_in = getFrame(extract_begin + loaded_frames);
       assert(frame_in);
-      int err;  // ignore key absent error: no scene change info is not critical
+      requested_frames[loaded_frames] = frame_in;
+      int err;
       if (vsapi->mapGetInt(vsapi->getFramePropertiesRO(frame_in), "_SceneChangePrev", 0, &err)) {
-        first_frame = frame_in;
-        // This frame starts next scene. Record its index, and stop at previous frame
-        scene_begin_index_pending = begin + loaded_frames;
+        end_of_scene = true;
+        extract_end = m + loaded_frames;
         break;
       }
-      loadFrameAt(frame_in, loaded_frames);
-      requested_frames[loaded_frames + 1] = frame_in;
     }
 
-    // This happens if we just reached the end for this scene.
-    // We then skip extract, duplicate extract output to match frame count.
-    if (loaded_frames == 0) {
-      session->duplicateExtractOutput(0, 1);
-      loaded_frames = 1;
+    if (extract_end == num_frames) {
+      end_of_scene = true;
+    }
+
+    // for extra_frame case the last frame of scene is virtually duplicated
+    // so we can get exact 2x frames.
+    auto least_frame_count = config.input_count;
+    if (config.extra_frame && end_of_scene) {
+      --least_frame_count;
+    }
+    if ((loaded_frames + recycle_frames) < least_frame_count && !start_of_scene) {
+      recycle_frames = least_frame_count - loaded_frames;
+    }
+
+    if (recycle_frames) {
+      std::rotate(requested_frames.rbegin(), requested_frames.rbegin() + recycle_frames, requested_frames.rend());
+      auto recycle_begin = config.batch_extract - recycle_frames + 1;
+      for (int i = 0; i < recycle_frames; ++i) {
+        //        trace("recycle frame " + std::to_string(i) + " is placed at position " +
+        //              std::to_string(session->internalFeatureIndex(i)));
+        session->duplicateExtractOutput(recycle_begin + i, i);
+      }
+      extract_begin -= recycle_frames;// always the first frame number in feature buffer (extract output)
+      fusion_in_begin = extract_begin;
+    }
+
+    // extra_frame, start_of_scene, full batch, so the first frame is extract separately
+    if (start_of_scene && loaded_frames > config.batch_extract) {
+      assert(recycle_frames == 0);
+      session->extractBatch(0, 0, 1);
+      //      trace("batch frame 0 is placed at position 0");
+      loadFrameAt(requested_frames[0], 0);
+      session->extract();
+      --loaded_frames;
+      ++recycle_frames;// from now on meaning of recycle_frames changed to number of frames already filled in feature buffer
+    }
+
+    if (recycle_frames > 1 || loaded_frames < config.batch_extract) {
+      // we recycled frame from last batch, or don't have enough frame to make a batch,
+      // which makes remain frames non-contiguous so can't be batched
+//      trace("non-full batch");
+      for (int i = 0; i < loaded_frames; ++i) {
+        loadFrameAt(requested_frames[recycle_frames + i], 0);
+        //        trace("batch frame " + std::to_string(recycle_frames + i) + " is placed at position " +
+        //              std::to_string(session->internalFeatureIndex(recycle_frames + i)));
+        session->extractBatch(0, session->internalFeatureIndex(recycle_frames + i), 1);
+        session->extract();
+      }
     }
     else {
-      // process all new frames.
-      session->extractBatch(0, 1, loaded_frames);
-      session->extract();
-
-      if (loaded_frames != config.batch_extract) {
-        // We reached end of scene. duplicate extract output of last frame to match frame count.
-        session->duplicateExtractOutput(loaded_frames, loaded_frames + 1);
+      for (int i = 0; i < loaded_frames; ++i) {
+        //        trace("batch frame " + std::to_string(recycle_frames + i) + " is placed at position " +
+        //              std::to_string(session->internalFeatureIndex(recycle_frames + i)));
+        loadFrameAt(requested_frames[recycle_frames + i],
+                    session->internalFeatureIndex(recycle_frames + i) - recycle_frames);
       }
+      session->extractBatch(0, recycle_frames, config.batch_extract);
+      session->extract();
     }
   }
 
-  int fusion_index = extract_index % config.batch_fusion;
+  // doing fusion on extracted results.
 
-  // a fusion batch starts at this frame
-  if (fusion_index == 0) {
-    int begin = extract_index;
-    int end = std::min(begin + config.batch_fusion, loaded_frames + 1);
-    session->fusionBatch(begin, 0, end - begin);
-    session->fusion();
+  if (start_of_batch || m == fusion_in_begin) {
+    // 1. try to consume n frame groups, with n <= config.batch_fusion
+    //    If extra_frame and end_of_scene, consider last frame is duplicated
+    // 2. adjust fusion_begin, try to work on latest config.input_count frame
+    // 3. point last frames to duplicate frames to get config.input_count frame
+
+    // e.g. for extra_frame case:
+    // scene has 7 frames: 0 1 2 3 4 5 6
+    // input_count = 4, fusion_batch = 1
+    // fusion_begin = 0, extract_end = 7
+    // 1. grouped fusion, batch = 1, fusion_begin = 3 now
+    // 2. grouped fusion, batch = 1, fusion_begin = 6 now
+    // *. fusion_begin + 1 == extract_end is done
+
+    // e.g. for extra_frame and end_of_scene case:
+    // scene has 2 frames: 0 1
+    // input_count = 4
+    // fusion_begin = 0, extract_end = 6, fusion_begin = 0
+    // 1. custom fusion on 0 1 1 1, done
+
+    // scene has 5 frames: 0 1 2 3 4
+    // input_count = 4
+    // fusion_begin = 0, extract_end = 6, fusion_begin = 0
+    // 1. grouped fusion, batch = 1, fusion_begin = 3 now
+    // 2. custom fusion on 2 3 4 4, done
+
+    // scene has 6 frames: 0 1 2 3 4 5
+    // input_count = 4
+    // fusion_begin = 0, extract_end = 6, fusion_begin = 0
+    // 1. grouped fusion, batch = 1, fusion_begin = 3 now
+    // 2. custom fusion on 3 4 5 5, done
+
+    // scene has 7 frames: 0 1 2 3 4 5 6
+    // input_count = 4
+    // fusion_begin = 0, extract_end = 7
+    // 1. grouped fusion, batch = 2, fusion_begin = 6 now
+    // 2. custom fusion on 4 5 6 6, done
+
+    auto available = extract_end - fusion_in_begin - int(config.extra_frame);
+    auto one_batch = config.input_count - int(config.extra_frame);
+
+    auto batch = std::min(available / one_batch, config.batch_fusion);
+    if (batch) {
+      if (m != extract_begin) {
+        auto fusion_idx = m - extract_begin;
+        session->duplicateExtractOutput(fusion_idx, fusion_idx - 1);
+      }
+
+      auto offset = (fusion_in_begin - extract_begin) / (config.batch_fusion * one_batch);
+      //      trace("batched fusion, processing " + std::to_string(batch) + " batch from " +
+      //            std::to_string(offset * config.batch_fusion));
+      session->fusionBatch(batch);
+      session->fusionGroupedOffset(offset);
+      session->fusion();
+      fusion_out_begin = fusion_in_begin;
+      fusion_in_begin += batch * one_batch;
+    }
+    else {
+      auto end_idx = extract_end - 1;
+      auto begin_idx = std::max(extract_begin, end_idx - one_batch + 1);
+      std::vector<int32_t> indexes(config.input_count);
+      for (int i = 0; i < config.input_count; ++i) {
+        indexes[i] = std::min(begin_idx + i, end_idx) - extract_begin;
+      }
+      //      trace("non-batched fusion on frames " + std::to_string(begin_idx) + " to " + std::to_string(end_idx));
+      session->fusionBatch(1);
+      session->fusionCustomOffset(indexes);
+      session->fusion();
+      fusion_out_begin = begin_idx;
+    }
   }
 
   return "";
 }
 
-std::string CycMuNetFilter::extractFrame(int n, VSFrame *&frame, VSCore *core, const VSAPI *vsapi) {
-  int offset = (n - 2 * scene_begin_index) % (2 * config.batch_extract);
-  int src_index = offset / 2;
-  bool free_src = offset % 2;
-  offset %= 2 * config.batch_fusion;
+std::string NNVISRFilter::extractFrame(int n, const VSFrame *&frame, VSCore *core, const VSAPI *vsapi) {
+  int offset;
+  int src_index;
+  bool free_src;
+  bool from_source;
+  if (config.interpolation) {
+    offset = n - 2 * fusion_out_begin;
+    src_index = n / 2 - extract_begin;
+    free_src = offset % 2;
+    from_source = !config.double_frame && !free_src;
+  }
+  else {
+    offset = n - fusion_out_begin;
+    src_index = n - extract_begin;
+    free_src = true;
+    from_source = false;
+  }
 
-  frame = vsapi->newVideoFrame(&vo.format, vo.width, vo.height, requested_frames[src_index], core);
+  auto adjust_duration = [&](VSFrame* frame, bool modify_timestamp) {
+    auto prop = vsapi->getFramePropertiesRW(frame);
+    auto num = vsapi->mapGetInt(prop, "_DurationNum", 0, nullptr) * 2;
+    auto den = vsapi->mapGetInt(prop, "_DurationDen", 0, nullptr);
+    vsh::reduceRational(&num, &den);
+    vsapi->mapSetInt(prop, "_DurationNum", num, false);
+    vsapi->mapSetInt(prop, "_DurationDen", den, false);
+    if (modify_timestamp) {
+      int err;
+      auto time = vsapi->mapGetFloat(prop, "_AbsoluteTime", 0, &err);
+      if (!err) {
+        time += double(num) / den;
+        vsapi->mapSetFloat(prop, "_AbsoluteTime", time, false);
+      }
+    }
+  };
+
+  if (from_source) {
+    // model doing frame interpolation but not producing double frame,
+    // so model only outputs intermediate frames (no enhancement for input frame)
+    // in this case we just return original frame.
+    auto n_frame = vsapi->copyFrame(requested_frames[src_index], core);
+    if (config.interpolation) {
+      adjust_duration(n_frame, false);
+    }
+    frame = n_frame;
+    return "";
+  }
+
+  auto n_frame = vsapi->newVideoFrame(&vo.format, vo.width, vo.height, requested_frames[src_index], core);
+  if (config.interpolation) {
+    adjust_duration(n_frame, true);
+  }
+  frame = n_frame;
   if (free_src) {
+//    trace("free frame " + std::to_string(n / 2));
     vsapi->freeFrame(requested_frames[src_index]);
     requested_frames[src_index] = nullptr;
+    if (end_of_scene && n + 1 == extract_end) {
+//      trace("free frame " + std::to_string(n / 2 + 1));
+      vsapi->freeFrame(requested_frames[src_index + 1]);
+      requested_frames[src_index + 1] = nullptr;
+    }
   }
 
   if (color_family == VSColorFamily::cfRGB) {
     if (vo.format.sampleType == VSSampleType::stFloat) {
       if (vo.format.bytesPerSample == 2) {
-        return writeRGB<half>(offset, frame, vsapi);
+        return downloadRGB<half>(offset, n_frame, vsapi);
       }
       else if (vo.format.bytesPerSample == 4) {
-        return writeRGB<float>(offset, frame, vsapi);
+        return downloadRGB<float>(offset, n_frame, vsapi);
       }
     } else {
       if (vo.format.bytesPerSample == 1) {
-        return writeRGB<uint8_t>(offset, frame, vsapi);
+        return downloadRGB<uint8_t>(offset, n_frame, vsapi);
       }
       else if (vo.format.bytesPerSample == 2) {
-        return writeRGB<uint16_t>(offset, frame, vsapi);
+        return downloadRGB<uint16_t>(offset, n_frame, vsapi);
       }
     }
   }
   else {
     if (vo.format.sampleType == VSSampleType::stFloat) {
       if (vo.format.bytesPerSample == 2) {
-        return writeYUV<half>(offset, frame, vsapi);
+        return downloadYUV<half>(offset, n_frame, vsapi);
       }
       else if (vo.format.bytesPerSample == 4) {
-        return writeYUV<float>(offset, frame, vsapi);
+        return downloadYUV<float>(offset, n_frame, vsapi);
       }
     } else {
       if (vo.format.bytesPerSample == 1) {
-        return writeYUV<uint8_t>(offset, frame, vsapi);
+        return downloadYUV<uint8_t>(offset, n_frame, vsapi);
       }
       else if (vo.format.bytesPerSample == 2) {
-        return writeYUV<uint16_t>(offset, frame, vsapi);
+        return downloadYUV<uint16_t>(offset, n_frame, vsapi);
       }
     }
 
-    return "CycMuNet: unexpected format";
+    return "NNVISR: unexpected format";
   }
 
   return "";
 }
 
-CycMuNetFilter::~CycMuNetFilter() {
+NNVISRFilter::~NNVISRFilter() {
   for (auto p: ioBuffer) {
     if (p != nullptr) {
       cudaFree(p);
@@ -1081,19 +1379,28 @@ CycMuNetFilter::~CycMuNetFilter() {
 // ---------------------------------------------------------------------------------------------------------------------
 // VS API
 
-static const VSFrame *VS_CC cycmunetGetFrame(int n, int activationReason, void *instanceData, void **frameData,
-                                             VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
-  auto *filter = static_cast<CycMuNetFilter *>(instanceData);
+static const VSFrame *VS_CC NNVISRGetFrame(int n, int activationReason, void *instanceData, void **frameData,
+                                           VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+  auto *filter = static_cast<NNVISRFilter *>(instanceData);
   std::string err;
 
   if (activationReason == arInitial) {
-    filter->requestFrames(n, frameCtx, vsapi);
+    err = filter->requestFrames(n, frameCtx, vsapi);
+    if (!err.empty()) {
+      vsapi->setFilterError(err.c_str(), frameCtx);
+      vsapi->freeNode(filter->node);
+    }
     return nullptr;
   }
   else if (activationReason == arAllFramesReady) {
     if (n == 0) {
       const VSFrame *frame = vsapi->getFrameFilter(0, filter->node, frameCtx);
-      filter->init2(frame, core, vsapi);
+      err = filter->init2(frame, core, vsapi);
+      if (!err.empty()) {
+        vsapi->setFilterError(err.c_str(), frameCtx);
+        vsapi->freeNode(filter->node);
+        return nullptr;
+      }
     }
 
     err = filter->prepareFrame(n, frameCtx, vsapi);
@@ -1103,7 +1410,7 @@ static const VSFrame *VS_CC cycmunetGetFrame(int n, int activationReason, void *
       return nullptr;
     }
 
-    VSFrame *out{};
+    const VSFrame *out {};
     err = filter->extractFrame(n, out, core, vsapi);
     if (err.empty()) {
       err = filter->synchronize();
@@ -1118,14 +1425,19 @@ static const VSFrame *VS_CC cycmunetGetFrame(int n, int activationReason, void *
   return nullptr;
 }
 
-static void VS_CC cycmunetFree(void *instanceData, VSCore *, const VSAPI *vsapi) {
-  auto *d = static_cast<CycMuNetFilter *>(instanceData);
+static void VS_CC NNVISRFree(void *instanceData, VSCore *, const VSAPI *vsapi) {
+  auto *d = static_cast<NNVISRFilter *>(instanceData);
   vsapi->freeNode(d->node);
+  for (auto f: d->requested_frames) {
+    if (f) {
+      vsapi->freeFrame(f);
+    }
+  }
   delete d;
 }
 
-static void VS_CC cycmunetCreate(const VSMap *in, VSMap *out, void *, VSCore *core, const VSAPI *vsapi) {
-  auto filter = new CycMuNetFilter();
+static void VS_CC NNVISRCreate(const VSMap *in, VSMap *out, void *, VSCore *core, const VSAPI *vsapi) {
+  auto filter = new NNVISRFilter();
   auto err = filter->init1(in, core, vsapi);
   if (!err.empty()) {
     vsapi->mapSetError(out, err.c_str());
@@ -1134,8 +1446,10 @@ static void VS_CC cycmunetCreate(const VSMap *in, VSMap *out, void *, VSCore *co
   }
 
   VSFilterDependency deps[] = {{filter->node, rpNoFrameReuse}};
-  vsapi->createVideoFilter(out, "CycMuNet", &filter->vo, cycmunetGetFrame, cycmunetFree, fmFrameState, deps, 1, filter,
-                           core);
+  vsapi->createVideoFilter(out, "NNVISR", &filter->vo, NNVISRGetFrame, NNVISRFree, fmFrameState, deps, 1, filter, core);
+  auto out_node = vsapi->mapGetNode(out, "clip", 0, nullptr);
+  vsapi->setLinearFilter(out_node);
+  vsapi->freeNode(out_node);
 }
 
 static void VS_CC dependencyVersion(const VSMap *, VSMap *out, void *, VSCore *, const VSAPI *vsapi) {
@@ -1153,14 +1467,20 @@ static void VS_CC dependencyVersion(const VSMap *, VSMap *out, void *, VSCore *,
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
   UDOLayers::registerPlugins();
-  vspapi->configPlugin("dev.tyty.aim.cycmunet", "cycmunet", "CycMuNet+ Spatial-Temporal Super Resolution Filter",
+  vspapi->configPlugin("dev.tyty.aim.nnvisr", "nnvisr", "Neural Network Video Interpolation / Super Resolution Filter",
                        VS_MAKE_VERSION(1, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
-  vspapi->registerFunction("CycMuNet",
+  vspapi->registerFunction("Super",
                            "clip:vnode;"
                            "scale_factor:float;"
+                           "scale_factor_h:float:opt;"
                            "batch_size:int:opt;"
                            "batch_size_fusion:int:opt;"
+                           "input_count:int:opt;"
+                           "feature_count:int:opt;"
                            "extraction_layers:int:opt;"
+                           "interpolation:int:opt;"
+                           "extra_frame:int:opt;"
+                           "double_frame:int:opt;"
                            "use_fp16:int:opt;"
                            "norm_mean:float[]:opt;"
                            "norm_std:float[]:opt;"
@@ -1168,6 +1488,6 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
                            "model:data:opt;"
                            "model_path:data:opt;"
                            "low_mem:int:opt;",
-                           "clip:vnode;", cycmunetCreate, nullptr, plugin);
-  vspapi->registerFunction("CycMuNetVersion", "", "", dependencyVersion, nullptr, plugin);
+                           "clip:vnode;", NNVISRCreate, nullptr, plugin);
+  vspapi->registerFunction("Version", "", "", dependencyVersion, nullptr, plugin);
 }

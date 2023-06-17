@@ -1,15 +1,16 @@
 #pragma once
 
 #include <array>
-#include <vector>
 #include <cstdint>
-#include <string>
 #include <filesystem>
+#include <string>
+#include <vector>
 
-#include <NvInfer.h>
+#include "NvInferRuntime.h"
 
-#include "utils.h"
 #include "config.h"
+#include "md_view.h"
+#include "utils.h"
 
 template<class T>
 struct ModelStuff {
@@ -33,40 +34,44 @@ class InferenceContext {
   bool has_file();
   bool load_engine();
 
-  bool good() {
-    return runtime != nullptr && engine.feature_extract != nullptr && engine.feature_fusion != nullptr;
-  }
+  bool good() { return runtime != nullptr && engine.feature_extract != nullptr && engine.feature_fusion != nullptr; }
 };
 
 class InferenceSession {
   InferenceContext ctx;
 
-  ModelStuff<nvinfer1::IExecutionContext*> context;
-  std::vector<void*> cudaBuffers;
-  void* executionMemory;
+  ModelStuff<nvinfer1::IExecutionContext *> context;
+  std::vector<void *> cudaBuffers;
+  void *executionMemory;
   ModelStuff<int32_t> last_batch, last_offset_in, last_offset_out;
-  size_t input_size_;
-  size_t output_size_;
-  std::vector<size_t> feature_sizes;
   bool good_;
+
+  void trace(const std::string &info) {
+    // no fold
+//     ctx.logger.log(nvinfer1::ILogger::Severity::kINFO, ("Infer Trace: " + info).c_str());
+  }
 
  public:
   cudaStream_t stream;
-  std::array<void*, 2> input;
-  std::array<void*, 4> output;
 
-  explicit InferenceSession(InferenceContext& ctx);
+  md_view<uint8_t, 5> input, input_uv;
+  md_view<uint8_t, 7> output, output_uv;
+  std::vector<md_view<uint8_t, 5>> features;
+
+  explicit InferenceSession(InferenceContext &ctx);
   ~InferenceSession();
 
   bool good() const { return good_; }
 
   void extractBatch(int32_t offset_in, int32_t offset_out, int32_t batch);
-  void fusionBatch(int32_t offset_in, int32_t offset_out, int32_t batch);
-
-  size_t input_size() const { return input_size_; }
-  size_t output_size() const { return output_size_; }
+  void fusionBatch(int32_t batch);
+  void fusionGroupedOffset(int32_t group_idx);
+  void fusionCustomOffset(const std::vector<int32_t> &indexes);
 
   void duplicateExtractOutput(int32_t from, int32_t to);
+
+  int32_t internalFeatureIndex(int32_t idx);
+  shape_t<3> outputIndex(offset_t idx);
 
   bool extract();
   bool fusion();
